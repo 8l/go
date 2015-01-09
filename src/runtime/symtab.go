@@ -34,12 +34,30 @@ var (
 	ftab      []functab
 	filetab   []uint32
 
-	pclntab, epclntab struct{} // linker symbols
+	pclntab, epclntab, findfunctab struct{} // linker symbols
+
+	minpc, maxpc uintptr
 )
 
 type functab struct {
 	entry   uintptr
 	funcoff uintptr
+}
+
+const minfunc = 16 // minimum function size
+const pcbucketsize = 256*minfunc // size of bucket in the pc->func lookup table
+
+// findfunctab is an array of these structures.
+// Each bucket represents 4096 bytes of the text segment.
+// Each subbucket represents 256 bytes of the text segment.
+// To find a function given a pc, locate the bucket and subbucket for
+// that pc.  Add together the idx and subbucket value to obtain a
+// function index.  Then scan the functab array starting at that
+// index to find the target function.
+// This table uses 20 bytes for every 4096 bytes of code, or ~0.5% overhead.
+type findfuncbucket struct {
+	idx uint32
+	subbuckets [16]byte
 }
 
 func symtabinit() {
@@ -50,7 +68,7 @@ func symtabinit() {
 	pcln32 := (*[2]uint32)(unsafe.Pointer(&pclntab))
 	if pcln32[0] != 0xfffffffb || pcln[4] != 0 || pcln[5] != 0 || pcln[6] != _PCQuantum || pcln[7] != ptrSize {
 		println("runtime: function symbol table header:", hex(pcln32[0]), hex(pcln[4]), hex(pcln[5]), hex(pcln[6]), hex(pcln[7]))
-		gothrow("invalid function symbol table\n")
+		throw("invalid function symbol table\n")
 	}
 
 	// pclntable is all bytes of pclntab symbol.
@@ -73,13 +91,13 @@ func symtabinit() {
 			f2 := (*_func)(unsafe.Pointer(&pclntable[ftab[i+1].funcoff]))
 			f2name := "end"
 			if i+1 < nftab {
-				f2name = gofuncname(f2)
+				f2name = funcname(f2)
 			}
-			println("function symbol table not sorted by program counter:", hex(ftab[i].entry), gofuncname(f1), ">", hex(ftab[i+1].entry), f2name)
+			println("function symbol table not sorted by program counter:", hex(ftab[i].entry), funcname(f1), ">", hex(ftab[i+1].entry), f2name)
 			for j := 0; j <= i; j++ {
-				print("\t", hex(ftab[j].entry), " ", gofuncname((*_func)(unsafe.Pointer(&pclntable[ftab[j].funcoff]))))
+				print("\t", hex(ftab[j].entry), " ", funcname((*_func)(unsafe.Pointer(&pclntable[ftab[j].funcoff]))), "\n")
 			}
-			gothrow("invalid runtime symbol table")
+			throw("invalid runtime symbol table")
 		}
 	}
 
@@ -96,6 +114,9 @@ func symtabinit() {
 	sp.cap = 1
 	sp.len = int(filetab[0])
 	sp.cap = sp.len
+
+	minpc = ftab[0].entry
+	maxpc = ftab[nftab].entry
 }
 
 // FuncForPC returns a *Func describing the function that contains the
@@ -106,7 +127,7 @@ func FuncForPC(pc uintptr) *Func {
 
 // Name returns the name of the function.
 func (f *Func) Name() string {
-	return gofuncname(f.raw())
+	return funcname(f.raw())
 }
 
 // Entry returns the entry address of the function.
@@ -126,32 +147,26 @@ func (f *Func) FileLine(pc uintptr) (file string, line int) {
 }
 
 func findfunc(pc uintptr) *_func {
-	if len(ftab) == 0 {
+	if pc < minpc || pc >= maxpc {
 		return nil
 	}
+	const nsub = uintptr(len(findfuncbucket{}.subbuckets))
 
-	if pc < ftab[0].entry || pc >= ftab[len(ftab)-1].entry {
-		return nil
+	x := pc - minpc
+	b := x / pcbucketsize
+	i := x % pcbucketsize / (pcbucketsize/nsub)
+
+	ffb := (*findfuncbucket)(add(unsafe.Pointer(&findfunctab), b * unsafe.Sizeof(findfuncbucket{})))
+	idx := ffb.idx + uint32(ffb.subbuckets[i])
+	if pc < ftab[idx].entry {
+		throw("findfunc: bad findfunctab entry")
 	}
 
-	// binary search to find func with entry <= pc.
-	lo := 0
-	nf := len(ftab) - 1 // last entry is sentinel
-	for nf > 0 {
-		n := nf / 2
-		f := &ftab[lo+n]
-		if f.entry <= pc && pc < ftab[lo+n+1].entry {
-			return (*_func)(unsafe.Pointer(&pclntable[f.funcoff]))
-		} else if pc < f.entry {
-			nf = n
-		} else {
-			lo += n + 1
-			nf -= n + 1
-		}
+	// linear search to find func with pc >= entry.
+	for ftab[idx+1].entry <= pc {
+		idx++
 	}
-
-	gothrow("findfunc: binary search failed")
-	return nil
+	return (*_func)(unsafe.Pointer(&pclntable[ftab[idx].funcoff]))
 }
 
 func pcvalue(f *_func, off int32, targetpc uintptr, strict bool) int32 {
@@ -178,7 +193,7 @@ func pcvalue(f *_func, off int32, targetpc uintptr, strict bool) int32 {
 		return -1
 	}
 
-	print("runtime: invalid pc-encoded table f=", gofuncname(f), " pc=", hex(pc), " targetpc=", hex(targetpc), " tab=", p, "\n")
+	print("runtime: invalid pc-encoded table f=", funcname(f), " pc=", hex(pc), " targetpc=", hex(targetpc), " tab=", p, "\n")
 
 	p = pclntable[off:]
 	pc = f.entry
@@ -192,26 +207,26 @@ func pcvalue(f *_func, off int32, targetpc uintptr, strict bool) int32 {
 		print("\tvalue=", val, " until pc=", hex(pc), "\n")
 	}
 
-	gothrow("invalid runtime symbol table")
+	throw("invalid runtime symbol table")
 	return -1
 }
 
-func funcname(f *_func) *byte {
+func cfuncname(f *_func) *byte {
 	if f == nil || f.nameoff == 0 {
 		return nil
 	}
 	return (*byte)(unsafe.Pointer(&pclntable[f.nameoff]))
 }
 
-func gofuncname(f *_func) string {
-	return gostringnocopy(funcname(f))
+func funcname(f *_func) string {
+	return gostringnocopy(cfuncname(f))
 }
 
 func funcline1(f *_func, targetpc uintptr, strict bool) (file string, line int32) {
 	fileno := int(pcvalue(f, f.pcfile, targetpc, strict))
 	line = pcvalue(f, f.pcln, targetpc, strict)
 	if fileno == -1 || line == -1 || fileno >= len(filetab) {
-		// print("looking for ", hex(targetpc), " in ", gofuncname(f), " got file=", fileno, " line=", lineno, "\n")
+		// print("looking for ", hex(targetpc), " in ", funcname(f), " got file=", fileno, " line=", lineno, "\n")
 		return "?", 0
 	}
 	file = gostringnocopy(&pclntable[filetab[fileno]])

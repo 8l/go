@@ -40,7 +40,7 @@ import "unsafe"
 //
 //	3. If the MCentral free list is empty, replenish it by
 //	   allocating a run of pages from the MHeap and then
-//	   chopping that memory into a objects of the given size.
+//	   chopping that memory into objects of the given size.
 //	   Allocating many objects amortizes the cost of locking
 //	   the heap.
 //
@@ -117,7 +117,17 @@ const (
 
 	// Number of orders that get caching.  Order 0 is FixedStack
 	// and each successive order is twice as large.
-	_NumStackOrders = 3
+	// We want to cache 2KB, 4KB, 8KB, and 16KB stacks.  Larger stacks
+	// will be allocated directly.
+	// Since FixedStack is different on different systems, we
+	// must vary NumStackOrders to keep the same maximum cached size.
+	//   OS               | FixedStack | NumStackOrders
+	//   -----------------+------------+---------------
+	//   linux/darwin/bsd | 2KB        | 4
+	//   windows/32       | 4KB        | 3
+	//   windows/64       | 8KB        | 2
+	//   plan9            | 4KB        | 3
+	_NumStackOrders = 4 - ptrSize/4*goos_windows - 1*goos_plan9
 
 	// Number of bits in page to span calculations (4k pages).
 	// On Windows 64-bit we limit the arena to 32GB or 35 bits.
@@ -434,6 +444,15 @@ type mheap struct {
 	arena_end      uintptr
 	arena_reserved bool
 
+	// write barrier shadow data+heap.
+	// 64-bit systems only, enabled by GODEBUG=wbshadow=1.
+	shadow_enabled  bool    // shadow should be updated and checked
+	shadow_reserved bool    // shadow memory is reserved
+	shadow_heap     uintptr // heap-addr + shadow_heap = shadow heap addr
+	shadow_data     uintptr // data-addr + shadow_data = shadow data addr
+	data_start      uintptr // start of shadowed data addresses
+	data_end        uintptr // end of shadowed data addresses
+
 	// central free lists for small size classes.
 	// the padding makes sure that the MCentrals are
 	// spaced CacheLineSize bytes apart, so that each MCentral.lock
@@ -476,8 +495,8 @@ type finblock struct {
 	alllink *finblock
 	next    *finblock
 	cnt     int32
-	cap     int32
-	fin     [1]finalizer
+	_       int32
+	fin     [(_FinBlockSize - 2*ptrSize - 2*4) / unsafe.Sizeof(finalizer{})]finalizer
 }
 
 // Information from the compiler about the layout of stack frames.
@@ -489,7 +508,7 @@ type bitvector struct {
 type stackmap struct {
 	n        int32   // number of bitmaps
 	nbit     int32   // number of bits in each bitmap
-	bytedata [0]byte // bitmaps, each starting on a 32-bit boundary
+	bytedata [1]byte // bitmaps, each starting on a 32-bit boundary
 }
 
 // Returns pointer map data for the given stackmap index

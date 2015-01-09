@@ -137,7 +137,7 @@ func newosproc(mp *m, stk unsafe.Pointer) {
 
 	if ret < 0 {
 		print("runtime: failed to create new OS thread (have ", mcount(), " already; errno=", -ret, ")\n")
-		gothrow("newosproc")
+		throw("newosproc")
 	}
 }
 
@@ -145,30 +145,18 @@ func osinit() {
 	ncpu = getproccount()
 }
 
-// Random bytes initialized at startup.  These come
-// from the ELF AT_RANDOM auxiliary vector (vdso_linux_amd64.c).
-// byte*	runtime·startup_random_data;
-// uint32	runtime·startup_random_data_len;
+var urandom_dev = []byte("/dev/urandom\x00")
 
-var urandom_data [_HashRandomBytes]byte
-var urandom_dev = []byte("/dev/random\x00")
-
-//go:nosplit
-func get_random_data(rnd *unsafe.Pointer, rnd_len *int32) {
-	if startup_random_data != nil {
-		*rnd = unsafe.Pointer(startup_random_data)
-		*rnd_len = int32(startup_random_data_len)
+func getRandomData(r []byte) {
+	if startupRandomData != nil {
+		n := copy(r, startupRandomData)
+		extendRandom(r, n)
 		return
 	}
 	fd := open(&urandom_dev[0], 0 /* O_RDONLY */, 0)
-	if read(fd, unsafe.Pointer(&urandom_data), _HashRandomBytes) == _HashRandomBytes {
-		*rnd = unsafe.Pointer(&urandom_data[0])
-		*rnd_len = _HashRandomBytes
-	} else {
-		*rnd = nil
-		*rnd_len = 0
-	}
+	n := read(fd, unsafe.Pointer(&r[0]), int32(len(r)))
 	close(fd)
+	extendRandom(r, int(n))
 }
 
 func goenvs() {
@@ -254,7 +242,21 @@ func setsig(i int32, fn uintptr, restart bool) {
 	}
 	sa.sa_handler = fn
 	if rt_sigaction(uintptr(i), &sa, nil, unsafe.Sizeof(sa.sa_mask)) != 0 {
-		gothrow("rt_sigaction failure")
+		throw("rt_sigaction failure")
+	}
+}
+
+func setsigstack(i int32) {
+	var sa sigactiont
+	if rt_sigaction(uintptr(i), nil, &sa, unsafe.Sizeof(sa.sa_mask)) != 0 {
+		throw("rt_sigaction failure")
+	}
+	if sa.sa_handler == 0 || sa.sa_handler == _SIG_DFL || sa.sa_handler == _SIG_IGN || sa.sa_flags&_SA_ONSTACK != 0 {
+		return
+	}
+	sa.sa_flags |= _SA_ONSTACK
+	if rt_sigaction(uintptr(i), &sa, nil, unsafe.Sizeof(sa.sa_mask)) != 0 {
+		throw("rt_sigaction failure")
 	}
 }
 
@@ -263,7 +265,7 @@ func getsig(i int32) uintptr {
 
 	memclr(unsafe.Pointer(&sa), unsafe.Sizeof(sa))
 	if rt_sigaction(uintptr(i), nil, &sa, unsafe.Sizeof(sa.sa_mask)) != 0 {
-		gothrow("rt_sigaction read failure")
+		throw("rt_sigaction read failure")
 	}
 	if sa.sa_handler == funcPC(sigtramp) {
 		return funcPC(sighandler)

@@ -29,6 +29,7 @@ import (
 //go:cgo_import_dynamic runtime._NtWaitForSingleObject NtWaitForSingleObject "ntdll.dll"
 //go:cgo_import_dynamic runtime._ResumeThread ResumeThread "kernel32.dll"
 //go:cgo_import_dynamic runtime._SetConsoleCtrlHandler SetConsoleCtrlHandler "kernel32.dll"
+//go:cgo_import_dynamic runtime._SetErrorMode SetErrorMode "kernel32.dll"
 //go:cgo_import_dynamic runtime._SetEvent SetEvent "kernel32.dll"
 //go:cgo_import_dynamic runtime._SetProcessPriorityBoost SetProcessPriorityBoost "kernel32.dll"
 //go:cgo_import_dynamic runtime._SetThreadPriority SetThreadPriority "kernel32.dll"
@@ -62,6 +63,7 @@ var (
 	_NtWaitForSingleObject,
 	_ResumeThread,
 	_SetConsoleCtrlHandler,
+	_SetErrorMode,
 	_SetEvent,
 	_SetProcessPriorityBoost,
 	_SetThreadPriority,
@@ -103,6 +105,13 @@ const (
 	currentThread  = ^uintptr(1) // -2 = current thread
 )
 
+const (
+	SEM_FAILCRITICALERRORS     = 0x0001
+	SEM_NOGPFAULTERRORBOX      = 0x0002
+	SEM_NOALIGNMENTFAULTEXCEPT = 0x0004
+	SEM_NOOPENFILEERRORBOX     = 0x8000
+)
+
 var (
 	kernel32Name                    = []byte("kernel32.dll\x00")
 	addVectoredContinueHandlerName  = []byte("AddVectoredContinueHandler\x00")
@@ -113,6 +122,10 @@ func osinit() {
 	setBadSignalMsg()
 
 	kernel32 := stdcall1(_LoadLibraryA, uintptr(unsafe.Pointer(&kernel32Name[0])))
+
+	// don't display the crash dialog
+	errormode := uint32(stdcall1(_SetErrorMode, SEM_NOGPFAULTERRORBOX))
+	stdcall1(_SetErrorMode, uintptr(errormode)|SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX|SEM_NOOPENFILEERRORBOX)
 
 	externalthreadhandlerp = funcPC(externalthreadhandler)
 
@@ -148,24 +161,21 @@ func osinit() {
 	}
 }
 
-var random_data [_HashRandomBytes]byte
-
 //go:nosplit
-func get_random_data(rnd *unsafe.Pointer, rnd_len *int32) {
+func getRandomData(r []byte) {
 	const (
 		prov_rsa_full       = 1
 		crypt_verifycontext = 0xF0000000
 	)
 	var handle uintptr
-	*rnd = nil
-	*rnd_len = 0
+	n := 0
 	if stdcall5(_CryptAcquireContextW, uintptr(unsafe.Pointer(&handle)), 0, 0, prov_rsa_full, crypt_verifycontext) != 0 {
-		if stdcall3(_CryptGenRandom, handle, _HashRandomBytes, uintptr(unsafe.Pointer(&random_data[0]))) != 0 {
-			*rnd = unsafe.Pointer(&random_data[0])
-			*rnd_len = _HashRandomBytes
+		if stdcall3(_CryptGenRandom, handle, uintptr(len(r)), uintptr(unsafe.Pointer(&r[0]))) != 0 {
+			n = len(r)
 		}
 		stdcall2(_CryptReleaseContext, handle, 0)
 	}
+	extendRandom(r, n)
 }
 
 func goenvs() {
@@ -249,7 +259,7 @@ func newosproc(mp *m, stk unsafe.Pointer) {
 		_STACK_SIZE_PARAM_IS_A_RESERVATION, 0)
 	if thandle == 0 {
 		println("runtime: failed to create new OS thread (have ", mcount(), " already; errno=", getlasterror(), ")")
-		gothrow("runtime.newosproc")
+		throw("runtime.newosproc")
 	}
 }
 
@@ -303,7 +313,7 @@ func systime(addr uintptr) int64 {
 		}
 	}
 	systemstack(func() {
-		gothrow("interrupt/system time is changing too fast")
+		throw("interrupt/system time is changing too fast")
 	})
 	return 0
 }

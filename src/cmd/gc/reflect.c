@@ -143,18 +143,6 @@ mapbucket(Type *t)
 	// We don't need to encode it as GC doesn't care about it.
 	offset = BUCKETSIZE * 1;
 
-	overflowfield = typ(TFIELD);
-	overflowfield->type = ptrto(bucket);
-	overflowfield->width = offset;         // "width" is offset in structure
-	overflowfield->sym = mal(sizeof(Sym)); // not important but needs to be set to give this type a name
-	overflowfield->sym->name = "overflow";
-	offset += widthptr;
-	
-	// The keys are padded to the native integer alignment.
-	// This is usually the same as widthptr; the exception (as usual) is nacl/amd64.
-	if(widthreg > widthptr)
-		offset += widthreg - widthptr;
-
 	keysfield = typ(TFIELD);
 	keysfield->type = typ(TARRAY);
 	keysfield->type->type = keytype;
@@ -175,11 +163,23 @@ mapbucket(Type *t)
 	valuesfield->sym->name = "values";
 	offset += BUCKETSIZE * valtype->width;
 
+	overflowfield = typ(TFIELD);
+	overflowfield->type = ptrto(bucket);
+	overflowfield->width = offset;         // "width" is offset in structure
+	overflowfield->sym = mal(sizeof(Sym)); // not important but needs to be set to give this type a name
+	overflowfield->sym->name = "overflow";
+	offset += widthptr;
+	
+	// Pad to the native integer alignment.
+	// This is usually the same as widthptr; the exception (as usual) is nacl/amd64.
+	if(widthreg > widthptr)
+		offset += widthreg - widthptr;
+
 	// link up fields
-	bucket->type = overflowfield;
-	overflowfield->down = keysfield;
+	bucket->type = keysfield;
 	keysfield->down = valuesfield;
-	valuesfield->down = T;
+	valuesfield->down = overflowfield;
+	overflowfield->down = T;
 
 	bucket->width = offset;
 	bucket->local = t->local;
@@ -731,7 +731,7 @@ dcommontype(Sym *s, int ot, Type *t)
 	dowidth(t);
 	alg = algtype(t);
 	algsym = S;
-	if(alg < 0)
+	if(alg < 0 || alg == AMEM)
 		algsym = dalgsym(t);
 
 	if(t->sym != nil && !isptr[t->etype])
@@ -791,7 +791,7 @@ dcommontype(Sym *s, int ot, Type *t)
 	if(gcprog)
 		i |= KindGCProg;
 	ot = duint8(s, ot, i);  // kind
-	if(alg >= 0)
+	if(algsym == S)
 		ot = dsymptr(s, ot, algarray, alg*sizeofAlg);
 	else
 		ot = dsymptr(s, ot, algsym, 0);
@@ -952,6 +952,55 @@ weaktypesym(Type *t)
 	//print("weaktypesym: %s -> %+S\n", p, s);
 	free(p);
 	return s;
+}
+
+/*
+ * Returns 1 if t has a reflexive equality operator.
+ * That is, if x==x for all x of type t.
+ */
+static int
+isreflexive(Type *t)
+{
+	Type *t1;
+	switch(t->etype) {
+		case TBOOL:
+		case TINT:
+		case TUINT:
+		case TINT8:
+		case TUINT8:
+		case TINT16:
+		case TUINT16:
+		case TINT32:
+		case TUINT32:
+		case TINT64:
+		case TUINT64:
+		case TUINTPTR:
+		case TPTR32:
+		case TPTR64:
+		case TUNSAFEPTR:
+		case TSTRING:
+		case TCHAN:
+			return 1;
+		case TFLOAT32:
+		case TFLOAT64:
+		case TCOMPLEX64:
+		case TCOMPLEX128:
+		case TINTER:
+			return 0;
+		case TARRAY:
+			if(isslice(t))
+				fatal("slice can't be a map key: %T", t);
+			return isreflexive(t->type);
+		case TSTRUCT:
+			for(t1=t->type; t1!=T; t1=t1->down) {
+				if(!isreflexive(t1->type))
+					return 0;
+			}
+			return 1;
+		default:
+			fatal("bad type for map key: %T", t);
+			return 0;
+	}
 }
 
 static Sym*
@@ -1123,6 +1172,7 @@ ok:
 			ot = duint8(s, ot, 0); // not indirect
 		}
 		ot = duint16(s, ot, mapbucket(t)->width);
+                ot = duint8(s, ot, isreflexive(t->down));
 		break;
 
 	case TPTR32:
@@ -1261,29 +1311,58 @@ dalgsym(Type *t)
 {
 	int ot;
 	Sym *s, *hash, *hashfunc, *eq, *eqfunc;
+	char *p;
 
 	// dalgsym is only called for a type that needs an algorithm table,
 	// which implies that the type is comparable (or else it would use ANOEQ).
 
-	s = typesymprefix(".alg", t);
-	hash = typesymprefix(".hash", t);
-	genhash(hash, t);
-	eq = typesymprefix(".eq", t);
-	geneq(eq, t);
+	if(algtype(t) == AMEM) {
+		// we use one algorithm table for all AMEM types of a given size
+		p = smprint(".alg%lld", t->width);
+		s = pkglookup(p, typepkg);
+		free(p);
+		if(s->flags & SymAlgGen)
+			return s;
+		s->flags |= SymAlgGen;
 
-	// make Go funcs (closures) for calling hash and equal from Go
-	hashfunc = typesymprefix(".hashfunc", t);
-	dsymptr(hashfunc, 0, hash, 0);
-	ggloblsym(hashfunc, widthptr, DUPOK|RODATA);
-	eqfunc = typesymprefix(".eqfunc", t);
-	dsymptr(eqfunc, 0, eq, 0);
-	ggloblsym(eqfunc, widthptr, DUPOK|RODATA);
+		// make hash closure
+		p = smprint(".hashfunc%lld", t->width);
+		hashfunc = pkglookup(p, typepkg);
+		free(p);
+		ot = 0;
+		ot = dsymptr(hashfunc, ot, pkglookup("memhash_varlen", runtimepkg), 0);
+		ot = duintxx(hashfunc, ot, t->width, widthptr); // size encoded in closure
+		ggloblsym(hashfunc, ot, DUPOK|RODATA);
 
+		// make equality closure
+		p = smprint(".eqfunc%lld", t->width);
+		eqfunc = pkglookup(p, typepkg);
+		free(p);
+		ot = 0;
+		ot = dsymptr(eqfunc, ot, pkglookup("memequal_varlen", runtimepkg), 0);
+		ot = duintxx(eqfunc, ot, t->width, widthptr);
+		ggloblsym(eqfunc, ot, DUPOK|RODATA);
+	} else {
+		// generate an alg table specific to this type
+		s = typesymprefix(".alg", t);
+		hash = typesymprefix(".hash", t);
+		eq = typesymprefix(".eq", t);
+		hashfunc = typesymprefix(".hashfunc", t);
+		eqfunc = typesymprefix(".eqfunc", t);
+
+		genhash(hash, t);
+		geneq(eq, t);
+
+		// make Go funcs (closures) for calling hash and equal from Go
+		dsymptr(hashfunc, 0, hash, 0);
+		ggloblsym(hashfunc, widthptr, DUPOK|RODATA);
+		dsymptr(eqfunc, 0, eq, 0);
+		ggloblsym(eqfunc, widthptr, DUPOK|RODATA);
+	}
 	// ../../runtime/alg.go:/typeAlg
 	ot = 0;
 	ot = dsymptr(s, ot, hashfunc, 0);
 	ot = dsymptr(s, ot, eqfunc, 0);
-
 	ggloblsym(s, ot, DUPOK|RODATA);
 	return s;
 }

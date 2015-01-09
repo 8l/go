@@ -37,7 +37,7 @@ rebuild=true
 if [ "$1" == "--no-rebuild" ]; then
 	shift
 else
-	echo '# Building packages and commands.'
+	echo '##### Building packages and commands.'
 	time go install -a -v std
 	echo
 fi
@@ -47,26 +47,30 @@ fi
 # at least runtime/debug test will fail.
 unset GOROOT_FINAL
 
-# increase timeout for ARM up to 3 times the normal value
+# TODO(adg): create an environment variable and to permit the builders to
+# specify the timeout scale.
 timeout_scale=1
+# the freebsd-* builders are slow, and there's no easy way to make them faster.
+[ "$GOOS" == "freebsd" ] && timeout_scale=2
+# increase timeout for ARM up to 3 times the normal value
 [ "$GOARCH" == "arm" ] && timeout_scale=3
 
-echo '# Testing packages.'
+echo '##### Testing packages.'
 time go test std -short -timeout=$(expr 120 \* $timeout_scale)s -gcflags "$GO_GCFLAGS"
 echo
 
 # We set GOMAXPROCS=2 in addition to -cpu=1,2,4 in order to test runtime bootstrap code,
 # creation of first goroutines and first garbage collections in the parallel setting.
-echo '# GOMAXPROCS=2 runtime -cpu=1,2,4'
+echo '##### GOMAXPROCS=2 runtime -cpu=1,2,4'
 GOMAXPROCS=2 go test runtime -short -timeout=$(expr 300 \* $timeout_scale)s -cpu=1,2,4
 echo
 
-echo '# sync -cpu=10'
+echo '##### sync -cpu=10'
 go test sync -short -timeout=$(expr 120 \* $timeout_scale)s -cpu=10
 
 xcd() {
 	echo
-	echo '#' $1
+	echo '#####' $1
 	builtin cd "$GOROOT"/src/$1 || exit 1
 }
 
@@ -114,6 +118,7 @@ export GOTRACEBACK=2
 go test -ldflags '-linkmode=auto' || exit 1
 # linkmode=internal fails on dragonfly since errno is a TLS relocation.
 [ "$GOHOSTOS" == dragonfly ] || go test -ldflags '-linkmode=internal' || exit 1
+# TODO(austin): Add linux-ppc64(le) once external linking works (issue #8912)
 case "$GOHOSTOS-$GOARCH" in
 openbsd-386 | openbsd-amd64)
 	# test linkmode=external, but __thread not supported, so skip testtls.
@@ -165,7 +170,7 @@ esac
 case "$GOHOSTOS-$GOOS-$GOARCH-$CGO_ENABLED" in
 linux-linux-amd64-1 | freebsd-freebsd-amd64-1 | darwin-darwin-amd64-1)
 	echo
-	echo '# Testing race detector.'
+	echo '##### Testing race detector.'
 	go test -race -i runtime/race flag os/exec
 	go test -race -run=Output runtime/race
 	go test -race -short flag os/exec
@@ -175,17 +180,6 @@ linux-linux-amd64-1 | freebsd-freebsd-amd64-1 | darwin-darwin-amd64-1)
 		go test -race -short -ldflags=-linkmode=external flag os/exec
 	fi
 esac
-
-# This tests cgo -cdefs. That mode is not supported,
-# so it's okay if it doesn't work on some systems.
-# In particular, it works badly with clang on OS X.
-# It doesn't work at all now that we disallow C code
-# outside runtime. Once runtime has no C code it won't
-# even be necessary.
-# [ "$CGO_ENABLED" != 1 ] || [ "$GOOS" == darwin ] ||
-# (xcd ../misc/cgo/testcdefs
-# ./test.bash || exit 1
-# ) || exit $?
 
 [ "$CGO_ENABLED" != 1 ] || [ "$GOOS" == darwin ] ||
 (xcd ../misc/cgo/testgodefs
@@ -239,7 +233,7 @@ time ./timing.sh -test || exit 1
 [ "$GOOS" == openbsd ] || # golang.org/issue/5057
 (
 echo
-echo '#' ../test/bench/go1
+echo '#####' ../test/bench/go1
 go test ../test/bench/go1 || exit 1
 ) || exit $?
 

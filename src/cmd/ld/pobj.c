@@ -184,8 +184,10 @@ main(int argc, char *argv[])
 	if(HEADTYPE == Hwindows)
 		dope();
 	addexport();
+	gentext();		// trampolines, call stubs, etc.
 	textaddress();
 	pclntab();
+	findfunctab();
 	symtab();
 	dodata();
 	address();

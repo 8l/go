@@ -28,7 +28,7 @@ func selectsize(size uintptr) uintptr {
 func newselect(sel *_select, selsize int64, size int32) {
 	if selsize != int64(selectsize(uintptr(size))) {
 		print("runtime: bad select size ", selsize, ", want ", selectsize(uintptr(size)), "\n")
-		gothrow("bad select size")
+		throw("bad select size")
 	}
 	sel.tcase = uint16(size)
 	sel.ncase = 0
@@ -53,7 +53,7 @@ func selectsend(sel *_select, c *hchan, elem unsafe.Pointer) (selected bool) {
 func selectsendImpl(sel *_select, c *hchan, pc uintptr, elem unsafe.Pointer, so uintptr) {
 	i := sel.ncase
 	if i >= sel.tcase {
-		gothrow("selectsend: too many cases")
+		throw("selectsend: too many cases")
 	}
 	sel.ncase = i + 1
 	cas := (*scase)(add(unsafe.Pointer(&sel.scase), uintptr(i)*unsafe.Sizeof(sel.scase[0])))
@@ -90,7 +90,7 @@ func selectrecv2(sel *_select, c *hchan, elem unsafe.Pointer, received *bool) (s
 func selectrecvImpl(sel *_select, c *hchan, pc uintptr, elem unsafe.Pointer, received *bool, so uintptr) {
 	i := sel.ncase
 	if i >= sel.tcase {
-		gothrow("selectrecv: too many cases")
+		throw("selectrecv: too many cases")
 	}
 	sel.ncase = i + 1
 	cas := (*scase)(add(unsafe.Pointer(&sel.scase), uintptr(i)*unsafe.Sizeof(sel.scase[0])))
@@ -115,7 +115,7 @@ func selectdefault(sel *_select) (selected bool) {
 func selectdefaultImpl(sel *_select, callerpc uintptr, so uintptr) {
 	i := sel.ncase
 	if i >= sel.tcase {
-		gothrow("selectdefault: too many cases")
+		throw("selectdefault: too many cases")
 	}
 	sel.ncase = i + 1
 	cas := (*scase)(add(unsafe.Pointer(&sel.scase), uintptr(i)*unsafe.Sizeof(sel.scase[0])))
@@ -263,7 +263,7 @@ func selectgoImpl(sel *_select) (uintptr, uint16) {
 		for i := 0; i+1 < int(sel.ncase); i++ {
 			if lockorder[i].sortkey() > lockorder[i+1].sortkey() {
 				print("i=", i, " x=", lockorder[i], " y=", lockorder[i+1], "\n")
-				gothrow("select: broken sort")
+				throw("select: broken sort")
 			}
 		}
 	*/
@@ -389,6 +389,7 @@ loop:
 			k.releasetime = sglist.releasetime
 		}
 		if sg == sglist {
+			// sg has already been dequeued by the G that woke us up.
 			cas = k
 		} else {
 			c = k._chan
@@ -411,7 +412,7 @@ loop:
 	c = cas._chan
 
 	if c.dataqsiz > 0 {
-		gothrow("selectgo: shouldn't happen")
+		throw("selectgo: shouldn't happen")
 	}
 
 	if debugSelect {
@@ -448,7 +449,7 @@ asyncrecv:
 		*cas.receivedp = true
 	}
 	if cas.elem != nil {
-		memmove(cas.elem, chanbuf(c, c.recvx), uintptr(c.elemsize))
+		typedmemmove(c.elemtype, cas.elem, chanbuf(c, c.recvx))
 	}
 	memclr(chanbuf(c, c.recvx), uintptr(c.elemsize))
 	c.recvx++
@@ -476,7 +477,7 @@ asyncsend:
 		racerelease(chanbuf(c, c.sendx))
 		raceReadObjectPC(c.elemtype, cas.elem, cas.pc, chansendpc)
 	}
-	memmove(chanbuf(c, c.sendx), cas.elem, uintptr(c.elemsize))
+	typedmemmove(c.elemtype, chanbuf(c, c.sendx), cas.elem)
 	c.sendx++
 	if c.sendx == c.dataqsiz {
 		c.sendx = 0
@@ -511,7 +512,7 @@ syncrecv:
 		*cas.receivedp = true
 	}
 	if cas.elem != nil {
-		memmove(cas.elem, sg.elem, uintptr(c.elemsize))
+		typedmemmove(c.elemtype, cas.elem, sg.elem)
 	}
 	sg.elem = nil
 	gp = sg.g
@@ -547,7 +548,7 @@ syncsend:
 		print("syncsend: sel=", sel, " c=", c, "\n")
 	}
 	if sg.elem != nil {
-		memmove(sg.elem, cas.elem, uintptr(c.elemsize))
+		typedmemmove(c.elemtype, sg.elem, cas.elem)
 	}
 	sg.elem = nil
 	gp = sg.g
@@ -594,6 +595,7 @@ const (
 	selectDefault           // default
 )
 
+//go:linkname reflect_rselect reflect.rselect
 func reflect_rselect(cases []runtimeSelect) (chosen int, recvOK bool) {
 	// flagNoScan is safe here, because all objects are also referenced from cases.
 	size := selectsize(uintptr(len(cases)))
@@ -624,23 +626,36 @@ func reflect_rselect(cases []runtimeSelect) (chosen int, recvOK bool) {
 	return
 }
 
-func (q *waitq) dequeueSudoG(s *sudog) {
-	var prevsgp *sudog
-	l := &q.first
-	for {
-		sgp := *l
-		if sgp == nil {
+func (q *waitq) dequeueSudoG(sgp *sudog) {
+	x := sgp.prev
+	y := sgp.next
+	if x != nil {
+		if y != nil {
+			// middle of queue
+			x.next = y
+			y.prev = x
+			sgp.next = nil
+			sgp.prev = nil
 			return
 		}
-		if sgp == s {
-			*l = sgp.next
-			if q.last == sgp {
-				q.last = prevsgp
-			}
-			s.next = nil
-			return
-		}
-		l = &sgp.next
-		prevsgp = sgp
+		// end of queue
+		x.next = nil
+		q.last = x
+		sgp.prev = nil
+		return
+	}
+	if y != nil {
+		// start of queue
+		y.prev = nil
+		q.first = y
+		sgp.next = nil
+		return
+	}
+
+	// x==y==nil.  Either sgp is the only element in the queue,
+	// or it has already been removed.  Use q.first to disambiguate.
+	if q.first == sgp {
+		q.first = nil
+		q.last = nil
 	}
 }

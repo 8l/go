@@ -271,6 +271,7 @@ struct	Node
 	uchar	noescape;	// func arguments do not escape
 	uchar	nosplit;	// func should not execute on separate stack
 	uchar	builtin;	// built-in name, like len or close
+	uchar	nowritebarrier;	// emit compiler error instead of write barrier
 	uchar	walkdef;
 	uchar	typecheck;
 	uchar	local;
@@ -383,6 +384,7 @@ enum
 	SymUniq		= 1<<3,
 	SymSiggen	= 1<<4,
 	SymAsm		= 1<<5,
+	SymAlgGen	= 1<<6,
 };
 
 struct	Sym
@@ -987,6 +989,7 @@ EXTERN	int	flag_race;
 EXTERN	int	flag_largemodel;
 EXTERN	int	noescape;
 EXTERN	int	nosplit;
+EXTERN	int	nowritebarrier;
 EXTERN	int	debuglive;
 EXTERN	Link*	ctxt;
 
@@ -1416,7 +1419,7 @@ Node*	cheapexpr(Node *n, NodeList **init);
 Node*	localexpr(Node *n, Type *t, NodeList **init);
 void	saveorignode(Node *n);
 int32	setlineno(Node *n);
-void	setmaxarg(Type *t);
+void	setmaxarg(Type *t, int32 extra);
 Type*	shallow(Type *t);
 int	simsimtype(Type *t);
 void	smagic(Magic *m);

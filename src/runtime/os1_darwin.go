@@ -45,20 +45,14 @@ func osinit() {
 	}
 }
 
-var urandom_data [_HashRandomBytes]byte
-var urandom_dev = []byte("/dev/random\x00")
+var urandom_dev = []byte("/dev/urandom\x00")
 
 //go:nosplit
-func get_random_data(rnd *unsafe.Pointer, rnd_len *int32) {
+func getRandomData(r []byte) {
 	fd := open(&urandom_dev[0], 0 /* O_RDONLY */, 0)
-	if read(fd, unsafe.Pointer(&urandom_data), _HashRandomBytes) == _HashRandomBytes {
-		*rnd = unsafe.Pointer(&urandom_data[0])
-		*rnd_len = _HashRandomBytes
-	} else {
-		*rnd = nil
-		*rnd_len = 0
-	}
+	n := read(fd, unsafe.Pointer(&r[0]), int32(len(r)))
 	close(fd)
+	extendRandom(r, int(n))
 }
 
 func goenvs() {
@@ -70,9 +64,9 @@ func goenvs() {
 	if !iscgo {
 		if bsdthread_register() != 0 {
 			if gogetenv("DYLD_INSERT_LIBRARIES") != "" {
-				gothrow("runtime: bsdthread_register error (unset DYLD_INSERT_LIBRARIES)")
+				throw("runtime: bsdthread_register error (unset DYLD_INSERT_LIBRARIES)")
 			}
-			gothrow("runtime: bsdthread_register error")
+			throw("runtime: bsdthread_register error")
 		}
 	}
 }
@@ -90,7 +84,7 @@ func newosproc(mp *m, stk unsafe.Pointer) {
 
 	if errno < 0 {
 		print("runtime: failed to create new OS thread (have ", mcount(), " already; errno=", -errno, ")\n")
-		gothrow("runtime.newosproc")
+		throw("runtime.newosproc")
 	}
 }
 
@@ -120,7 +114,7 @@ func unminit() {
 
 func macherror(r int32, fn string) {
 	print("mach error ", fn, ": ", r, "\n")
-	gothrow("mach error")
+	throw("mach error")
 }
 
 const _DebugMach = false
@@ -398,6 +392,10 @@ func setsig(i int32, fn uintptr, restart bool) {
 	sa.sa_tramp = unsafe.Pointer(funcPC(sigtramp)) // runtime·sigtramp's job is to call into real handler
 	*(*uintptr)(unsafe.Pointer(&sa.__sigaction_u)) = fn
 	sigaction(uint32(i), &sa, nil)
+}
+
+func setsigstack(i int32) {
+	throw("setsigstack")
 }
 
 func getsig(i int32) uintptr {

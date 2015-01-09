@@ -141,17 +141,17 @@ func newosproc(mp *m, _ unsafe.Pointer) {
 	)
 
 	if pthread_attr_init(&attr) != 0 {
-		gothrow("pthread_attr_init")
+		throw("pthread_attr_init")
 	}
 	if pthread_attr_setstack(&attr, 0, 0x200000) != 0 {
-		gothrow("pthread_attr_setstack")
+		throw("pthread_attr_setstack")
 	}
 	if pthread_attr_getstack(&attr, unsafe.Pointer(&mp.g0.stack.hi), &size) != 0 {
-		gothrow("pthread_attr_getstack")
+		throw("pthread_attr_getstack")
 	}
 	mp.g0.stack.lo = mp.g0.stack.hi - uintptr(size)
 	if pthread_attr_setdetachstate(&attr, _PTHREAD_CREATE_DETACHED) != 0 {
-		gothrow("pthread_attr_setdetachstate")
+		throw("pthread_attr_setdetachstate")
 	}
 
 	// Disable signals during create, so that the new thread starts
@@ -161,24 +161,18 @@ func newosproc(mp *m, _ unsafe.Pointer) {
 	sigprocmask(_SIG_SETMASK, &oset, nil)
 	if ret != 0 {
 		print("runtime: failed to create new OS thread (have ", mcount(), " already; errno=", ret, ")\n")
-		gothrow("newosproc")
+		throw("newosproc")
 	}
 }
 
-var urandom_data [_HashRandomBytes]byte
-var urandom_dev = []byte("/dev/random\x00")
+var urandom_dev = []byte("/dev/urandom\x00")
 
 //go:nosplit
-func get_random_data(rnd *unsafe.Pointer, rnd_len *int32) {
+func getRandomData(r []byte) {
 	fd := open(&urandom_dev[0], 0 /* O_RDONLY */, 0)
-	if read(fd, unsafe.Pointer(&urandom_data), _HashRandomBytes) == _HashRandomBytes {
-		*rnd = unsafe.Pointer(&urandom_data[0])
-		*rnd_len = _HashRandomBytes
-	} else {
-		*rnd = nil
-		*rnd_len = 0
-	}
+	n := read(fd, unsafe.Pointer(&r[0]), int32(len(r)))
 	close(fd)
+	extendRandom(r, int(n))
 }
 
 func goenvs() {
@@ -258,6 +252,10 @@ func setsig(i int32, fn uintptr, restart bool) {
 	sigaction(i, &sa, nil)
 }
 
+func setsigstack(i int32) {
+	throw("setsigstack")
+}
+
 func getsig(i int32) uintptr {
 	var sa sigactiont
 	sigaction(i, nil, &sa)
@@ -298,7 +296,7 @@ func semacreate() uintptr {
 	asmcgocall(unsafe.Pointer(&asmsysvicall6), unsafe.Pointer(&_g_.m.libcall))
 	sem = (*semt)(unsafe.Pointer(_g_.m.libcall.r1))
 	if sem_init(sem, 0, 0) != 0 {
-		gothrow("sem_init")
+		throw("sem_init")
 	}
 	return uintptr(unsafe.Pointer(sem))
 }
@@ -321,7 +319,7 @@ func semasleep(ns int64) int32 {
 			if *_m_.perrno == _ETIMEDOUT || *_m_.perrno == _EAGAIN || *_m_.perrno == _EINTR {
 				return -1
 			}
-			gothrow("sem_reltimedwait_np")
+			throw("sem_reltimedwait_np")
 		}
 		return 0
 	}
@@ -338,7 +336,7 @@ func semasleep(ns int64) int32 {
 		if *_m_.perrno == _EINTR {
 			continue
 		}
-		gothrow("sem_wait")
+		throw("sem_wait")
 	}
 	return 0
 }
@@ -346,7 +344,7 @@ func semasleep(ns int64) int32 {
 //go:nosplit
 func semawakeup(mp *m) {
 	if sem_post((*semt)(unsafe.Pointer(mp.waitsema))) != 0 {
-		gothrow("sem_post")
+		throw("sem_post")
 	}
 }
 

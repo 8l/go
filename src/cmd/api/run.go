@@ -21,13 +21,14 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
-// goToolsVersion is the hg revision of the go.tools subrepo we need
+// goToolsVersion is the git revision of the x/tools subrepo we need
 // to build cmd/api.  This only needs to be updated whenever a go/types
 // bug fix is needed by the cmd/api tool.
-const goToolsVersion = "6698ca2900e2"
+const goToolsVersion = "875ff2496f865e" // aka hg 6698ca2900e2
 
 var goroot string
 
@@ -37,9 +38,9 @@ func main() {
 	if goroot == "" {
 		log.Fatal("No $GOROOT set.")
 	}
-	_, err := exec.LookPath("hg")
+	_, err := exec.LookPath("git")
 	if err != nil {
-		fmt.Println("Skipping cmd/api checks; hg not available")
+		fmt.Println("Skipping cmd/api checks; git not available")
 		return
 	}
 
@@ -53,7 +54,7 @@ func main() {
 	}
 
 	out, err = exec.Command("go", "tool", "api",
-		"-c", file("go1", "go1.1", "go1.2", "go1.3"),
+		"-c", file("go1", "go1.1", "go1.2", "go1.3", "go1.4"),
 		"-next", file("next"),
 		"-except", file("except")).CombinedOutput()
 	if err != nil {
@@ -91,7 +92,12 @@ func file(s ...string) string {
 // It tries to re-use a go.tools checkout from a previous run if possible,
 // else it hg clones it.
 func prepGoPath() string {
-	const tempBase = "go.tools.TMP"
+	// Use a builder-specific temp directory name, so builders running
+	// two copies don't trample on each other: https://golang.org/issue/9407
+	// We don't use io.TempDir or a PID or timestamp here because we do
+	// want this to be stable between runs, to minimize "git clone" calls
+	// in the common case.
+	var tempBase = fmt.Sprintf("go.tools.TMP.%s.%s", runtime.GOOS, runtime.GOARCH)
 
 	username := ""
 	u, err := user.Current()
@@ -105,9 +111,9 @@ func prepGoPath() string {
 	}
 
 	// The GOPATH we'll return
-	gopath := filepath.Join(os.TempDir(), "gopath-api-"+cleanUsername(username), goToolsVersion)
+	gopath := filepath.Join(os.TempDir(), "gopath-api-"+cleanUsername(username)+"-"+cleanUsername(strings.Fields(runtime.Version())[0]), goToolsVersion)
 
-	// cloneDir is where we run "hg clone".
+	// cloneDir is where we run "git clone".
 	cloneDir := filepath.Join(gopath, "src", "code.google.com", "p")
 
 	// The dir we clone into. We only atomically rename it to finalDir on
@@ -126,10 +132,7 @@ func prepGoPath() string {
 	if err := os.MkdirAll(cloneDir, 0700); err != nil {
 		log.Fatal(err)
 	}
-	cmd := exec.Command("hg",
-		"clone", "--rev="+goToolsVersion,
-		"https://code.google.com/p/go.tools",
-		tempBase)
+	cmd := exec.Command("git", "clone", "https://go.googlesource.com/tools", tempBase)
 	cmd.Dir = cloneDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -137,10 +140,29 @@ func prepGoPath() string {
 			log.Printf("# Skipping API check; network appears to be unavailable")
 			os.Exit(0)
 		}
-		log.Fatalf("Error running hg clone on go.tools: %v\n%s", err, out)
+		log.Fatalf("Error running git clone on x/tools: %v\n%s", err, out)
 	}
+	cmd = exec.Command("git", "reset", "--hard", goToolsVersion)
+	cmd.Dir = tmpDir
+	out, err = cmd.CombinedOutput()
+	if err != nil {
+		log.Fatalf("Error updating x/tools in %v to %v: %v, %s", tmpDir, goToolsVersion, err, out)
+	}
+
 	if err := os.Rename(tmpDir, finalDir); err != nil {
-		log.Fatal(err)
+		if os.IsExist(err) {
+			// A different builder beat us into putting this repo into
+			// its final place. But that's fine; if it's there, it's
+			// the right version and we can use it.
+			//
+			// This happens on the Go project's Windows builders
+			// especially, where we have two builders (386 and amd64)
+			// running at the same time, trying to compete for moving
+			// it into place.
+			os.RemoveAll(tmpDir)
+		} else {
+			log.Fatal(err)
+		}
 	}
 	return gopath
 }
@@ -162,23 +184,22 @@ func goToolsCheckoutGood(dir string) bool {
 		return false
 	}
 
-	cmd := exec.Command("hg", "id", "--id")
+	cmd := exec.Command("git", "rev-parse", "HEAD")
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {
 		return false
 	}
 	id := strings.TrimSpace(string(out))
-	if id != goToolsVersion {
+	if !strings.HasPrefix(id, goToolsVersion) {
 		return false
 	}
 
-	cmd = exec.Command("hg", "status")
+	cmd = exec.Command("git", "status", "--porcelain")
 	cmd.Dir = dir
 	out, err = cmd.Output()
-	if err != nil || len(out) > 0 {
+	if err != nil || strings.TrimSpace(string(out)) != "" {
 		return false
 	}
-
 	return true
 }

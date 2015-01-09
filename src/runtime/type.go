@@ -16,7 +16,7 @@ type _type struct {
 	align      uint8
 	fieldalign uint8
 	kind       uint8
-	alg        unsafe.Pointer
+	alg        *typeAlg
 	// gc stores _type info required for garbage collector.
 	// If (kind&KindGCProg)==0, then gc[0] points at sparse GC bitmap
 	// (no indirection), 4 bits per word.
@@ -47,7 +47,6 @@ type uncommontype struct {
 	name    *string
 	pkgpath *string
 	mhdr    []method
-	m       [0]method
 }
 
 type imethod struct {
@@ -59,7 +58,6 @@ type imethod struct {
 type interfacetype struct {
 	typ  _type
 	mhdr []imethod
-	m    [0]imethod
 }
 
 type maptype struct {
@@ -73,6 +71,7 @@ type maptype struct {
 	valuesize     uint8  // size of value slot
 	indirectvalue bool   // store ptr to value instead of value itself
 	bucketsize    uint16 // size of bucket
+	reflexivekey  bool   // true if k==k for all keys
 }
 
 type chantype struct {

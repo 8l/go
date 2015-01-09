@@ -69,6 +69,11 @@ static void	addpltsym(Link*, LSym*);
 static void	addgotsym(Link*, LSym*);
 static void	addgotsyminternal(Link*, LSym*);
 
+void
+gentext(void)
+{
+}
+
 // Preserve highest 8 bits of a, and do addition to lower 24-bit
 // of a and b; used to adjust ARM branch intruction's target
 static int32
@@ -366,6 +371,15 @@ archreloc(Reloc *r, LSym *s, vlong *val)
 	return -1;
 }
 
+vlong
+archrelocvariant(Reloc *r, LSym *s, vlong t)
+{
+	USED(r);
+	USED(s);
+	sysfatal("unexpected relocation variant");
+	return t;
+}
+
 static Reloc *
 addpltreloc(Link *ctxt, LSym *plt, LSym *got, LSym *sym, int typ)
 {
@@ -505,24 +519,8 @@ adddynsym(Link *ctxt, LSym *s)
 		/* shndx */
 		if(s->type == SDYNIMPORT)
 			adduint16(ctxt, d, SHN_UNDEF);
-		else {
-			switch(s->type) {
-			default:
-			case STEXT:
-				t = 11;
-				break;
-			case SRODATA:
-				t = 12;
-				break;
-			case SDATA:
-				t = 13;
-				break;
-			case SBSS:
-				t = 14;
-				break;
-			}
-			adduint16(ctxt, d, t);
-		}
+		else
+			adduint16(ctxt, d, 1);
 	} else {
 		diag("adddynsym: unsupported binary format");
 	}

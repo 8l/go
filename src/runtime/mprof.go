@@ -100,7 +100,7 @@ func newBucket(typ bucketType, nstk int) *bucket {
 	size := unsafe.Sizeof(bucket{}) + uintptr(nstk)*unsafe.Sizeof(uintptr(0))
 	switch typ {
 	default:
-		gothrow("invalid profile bucket type")
+		throw("invalid profile bucket type")
 	case memProfile:
 		size += unsafe.Sizeof(memRecord{})
 	case blockProfile:
@@ -123,7 +123,7 @@ func (b *bucket) stk() []uintptr {
 // mp returns the memRecord associated with the memProfile bucket b.
 func (b *bucket) mp() *memRecord {
 	if b.typ != memProfile {
-		gothrow("bad use of bucket.mp")
+		throw("bad use of bucket.mp")
 	}
 	data := add(unsafe.Pointer(b), unsafe.Sizeof(*b)+b.nstk*unsafe.Sizeof(uintptr(0)))
 	return (*memRecord)(data)
@@ -132,7 +132,7 @@ func (b *bucket) mp() *memRecord {
 // bp returns the blockRecord associated with the blockProfile bucket b.
 func (b *bucket) bp() *blockRecord {
 	if b.typ != blockProfile {
-		gothrow("bad use of bucket.bp")
+		throw("bad use of bucket.bp")
 	}
 	data := add(unsafe.Pointer(b), unsafe.Sizeof(*b)+b.nstk*unsafe.Sizeof(uintptr(0)))
 	return (*blockRecord)(data)
@@ -143,7 +143,7 @@ func stkbucket(typ bucketType, size uintptr, stk []uintptr, alloc bool) *bucket 
 	if buckhash == nil {
 		buckhash = (*[buckHashSize]*bucket)(sysAlloc(unsafe.Sizeof(*buckhash), &memstats.buckhash_sys))
 		if buckhash == nil {
-			gothrow("runtime: cannot allocate memory")
+			throw("runtime: cannot allocate memory")
 		}
 	}
 
@@ -564,20 +564,16 @@ func saveg(pc, sp uintptr, gp *g, r *StackRecord) {
 // If all is true, Stack formats stack traces of all other goroutines
 // into buf after the trace for the current goroutine.
 func Stack(buf []byte, all bool) int {
-	mp := acquirem()
-	gp := mp.curg
 	if all {
 		semacquire(&worldsema, false)
-		mp.gcing = 1
-		releasem(mp)
+		gp := getg()
+		gp.m.gcing = 1
 		systemstack(stoptheworld)
-		if mp != acquirem() {
-			gothrow("Stack: rescheduled")
-		}
 	}
 
 	n := 0
 	if len(buf) > 0 {
+		gp := getg()
 		sp := getcallersp(unsafe.Pointer(&buf))
 		pc := getcallerpc(unsafe.Pointer(&buf))
 		systemstack(func() {
@@ -594,11 +590,11 @@ func Stack(buf []byte, all bool) int {
 	}
 
 	if all {
-		mp.gcing = 0
+		gp := getg()
+		gp.m.gcing = 0
 		semrelease(&worldsema)
 		systemstack(starttheworld)
 	}
-	releasem(mp)
 	return n
 }
 

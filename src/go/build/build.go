@@ -267,6 +267,7 @@ var cgoEnabled = map[string]bool{
 	"linux/386":       true,
 	"linux/amd64":     true,
 	"linux/arm":       true,
+	"linux/ppc64le":   true,
 	"android/386":     true,
 	"android/amd64":   true,
 	"android/arm":     true,
@@ -688,7 +689,11 @@ Found:
 			p.Name = pkg
 			firstFile = name
 		} else if pkg != p.Name {
-			return p, &MultiplePackageError{p.Dir, []string{firstFile, name}, []string{p.Name, pkg}}
+			return p, &MultiplePackageError{
+				Dir:      p.Dir,
+				Packages: []string{p.Name, pkg},
+				Files:    []string{firstFile, name},
+			}
 		}
 		if pf.Doc != nil && p.Doc == "" {
 			p.Doc = doc.Synopsis(pf.Doc.Text())
@@ -1068,9 +1073,6 @@ func (ctxt *Context) shouldBuild(content []byte, allTags map[string]bool) bool {
 // saveCgo saves the information from the #cgo lines in the import "C" comment.
 // These lines set CFLAGS, CPPFLAGS, CXXFLAGS and LDFLAGS and pkg-config directives
 // that affect the way cgo's C code is built.
-//
-// TODO(rsc): This duplicates code in cgo.
-// Once the dust settles, remove this code from cgo.
 func (ctxt *Context) saveCgo(filename string, di *Package, cg *ast.CommentGroup) error {
 	text := cg.Text()
 	for _, line := range strings.Split(text, "\n") {
@@ -1116,10 +1118,12 @@ func (ctxt *Context) saveCgo(filename string, di *Package, cg *ast.CommentGroup)
 		if err != nil {
 			return fmt.Errorf("%s: invalid #cgo line: %s", filename, orig)
 		}
-		for _, arg := range args {
+		for i, arg := range args {
+			arg = expandSrcDir(arg, di.Dir)
 			if !safeCgoName(arg) {
 				return fmt.Errorf("%s: malformed #cgo argument: %s", filename, arg)
 			}
+			args[i] = arg
 		}
 
 		switch verb {
@@ -1138,6 +1142,14 @@ func (ctxt *Context) saveCgo(filename string, di *Package, cg *ast.CommentGroup)
 		}
 	}
 	return nil
+}
+
+func expandSrcDir(str string, srcdir string) string {
+	// "\" delimited paths cause safeCgoName to fail
+	// so convert native paths with a different delimeter
+	// to "/" before starting (eg: on windows)
+	srcdir = filepath.ToSlash(srcdir)
+	return strings.Replace(str, "${SRCDIR}", srcdir, -1)
 }
 
 // NOTE: $ is not safe for the shell, but it is allowed here because of linker options like -Wl,$ORIGIN.

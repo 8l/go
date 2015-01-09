@@ -327,7 +327,7 @@ ldelf(Biobuf *f, char *pkg, int64 len, char *pn)
 	int32 base;
 	uint64 add, info;
 	char *name;
-	int i, j, rela, is64, n;
+	int i, j, rela, is64, n, flag;
 	uchar hdrbuf[64];
 	uchar *p;
 	ElfHdrBytes *hdr;
@@ -545,12 +545,18 @@ ldelf(Biobuf *f, char *pkg, int64 len, char *pn)
 			s->type = SRODATA;
 			break;
 		case ElfSectFlagAlloc + ElfSectFlagWrite:
-			s->type = SNOPTRDATA;
+			if(sect->type == ElfSectNobits)
+				s->type = SNOPTRBSS;
+			else
+				s->type = SNOPTRDATA;
 			break;
 		case ElfSectFlagAlloc + ElfSectFlagExec:
 			s->type = STEXT;
 			break;
 		}
+		if(strcmp(sect->name, ".got") == 0 ||
+		   strcmp(sect->name, ".toc") == 0)
+			s->type = SELFGOT;
 		if(sect->type == ElfSectProgbits) {
 			s->p = sect->base;
 			s->np = sect->size;
@@ -612,6 +618,13 @@ ldelf(Biobuf *f, char *pkg, int64 len, char *pn)
 			if(s->external && !s->dupok)
 					diag("%s: duplicate definition of %s", pn, s->name);
 			s->external = 1;
+		}
+		if(obj->machine == ElfMachPower64) {
+			flag = sym.other >> 5;
+			if(2 <= flag && flag <= 6)
+				s->localentry = 1 << (flag - 2);
+			else if(flag == 7)
+				diag("%s: invalid sym.other 0x%x for %s", pn, sym.other, s->name);
 		}
 	}
 	
@@ -711,6 +724,8 @@ ldelf(Biobuf *f, char *pkg, int64 len, char *pn)
 				else
 					diag("invalid rela size %d", rp->siz);
 			}
+			if(rp->siz == 2)
+				rp->add = (int16)rp->add;
 			if(rp->siz == 4)
 				rp->add = (int32)rp->add;
 			//print("rel %s %d %d %s %#llx\n", sect->sym->name, rp->type, rp->siz, rp->sym->name, rp->add);
@@ -800,6 +815,10 @@ readsym(ElfObj *obj, int i, ElfSym *sym, int needSym)
 	s = nil;
 	if(strcmp(sym->name, "_GLOBAL_OFFSET_TABLE_") == 0)
 		sym->name = ".got";
+	if(strcmp(sym->name, ".TOC.") == 0)
+		// Magic symbol on ppc64.  Will be set to this object
+		// file's .got+0x8000.
+		sym->bind = ElfSymBindLocal;
 	switch(sym->type) {
 	case ElfSymTypeSection:
 		s = obj->sect[sym->shndx].sym;
@@ -825,14 +844,27 @@ readsym(ElfObj *obj, int i, ElfSym *sym, int needSym)
 			}
 			break;
 		case ElfSymBindLocal:
-			if(!(thechar == '5' && (strncmp(sym->name, "$a", 2) == 0 || strncmp(sym->name, "$d", 2) == 0))) // binutils for arm generate these mapping symbols, ignore these
+			if(thechar == '5' && (strncmp(sym->name, "$a", 2) == 0 || strncmp(sym->name, "$d", 2) == 0)) {
+				// binutils for arm generate these mapping
+				// symbols, ignore these
+				break;
+			}
+			if(strcmp(sym->name, ".TOC.") == 0) {
+				// We need to be able to look this up,
+				// so put it in the hash table.
 				if(needSym) {
-					// local names and hidden visiblity global names are unique
-					// and should only reference by its index, not name, so we
-					// don't bother to add them into hash table
-					s = linknewsym(ctxt, sym->name, ctxt->version);
+					s = linklookup(ctxt, sym->name, ctxt->version);
 					s->type |= SHIDDEN;
 				}
+				break;
+			}
+			if(needSym) {
+				// local names and hidden visiblity global names are unique
+				// and should only reference by its index, not name, so we
+				// don't bother to add them into hash table
+				s = linknewsym(ctxt, sym->name, ctxt->version);
+				s->type |= SHIDDEN;
+			}
 			break;
 		case ElfSymBindWeak:
 			if(needSym) {
@@ -876,6 +908,17 @@ reltype(char *pn, int elftype, uchar *siz)
 	switch(R(thechar, elftype)) {
 	default:
 		diag("%s: unknown relocation type %d; compiled without -fpic?", pn, elftype);
+	case R('9', R_PPC64_TOC16):
+	case R('9', R_PPC64_TOC16_LO):
+	case R('9', R_PPC64_TOC16_HI):
+	case R('9', R_PPC64_TOC16_HA):
+	case R('9', R_PPC64_TOC16_DS):
+	case R('9', R_PPC64_TOC16_LO_DS):
+	case R('9', R_PPC64_REL16_LO):
+	case R('9', R_PPC64_REL16_HI):
+	case R('9', R_PPC64_REL16_HA):
+		*siz = 2;
+		break;
 	case R('5', R_ARM_ABS32):
 	case R('5', R_ARM_GOT32):
 	case R('5', R_ARM_PLT32):
@@ -897,9 +940,11 @@ reltype(char *pn, int elftype, uchar *siz)
 	case R('8', R_386_PLT32):
 	case R('8', R_386_GOTOFF):
 	case R('8', R_386_GOTPC):
+	case R('9', R_PPC64_REL24):
 		*siz = 4;
 		break;
 	case R('6', R_X86_64_64):
+	case R('9', R_PPC64_ADDR64):
 		*siz = 8;
 		break;
 	}

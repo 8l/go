@@ -35,6 +35,7 @@
 
 enum {
 	MAXIO		= 8192,
+	MINFUNC		= 16,	// minimum size for a function
 };
 
 typedef struct Segment Segment;
@@ -227,6 +228,7 @@ vlong	entryvalue(void);
 void	errorexit(void);
 void	follow(void);
 void	genasmsym(void (*put)(LSym*, char*, int, vlong, vlong, int, LSym*));
+void	gentext(void);
 void	growdatsize(vlong *datsizep, LSym *s);
 char*	headstr(int v);
 int	headtype(char *name);
@@ -259,6 +261,7 @@ void	patch(void);
 int	pathchar(void);
 void	pcln(void);
 void	pclntab(void);
+void	findfunctab(void);
 void	putelfsectionsym(LSym* s, int shndx);
 void	putelfsymshndx(vlong sympos, int shndx);
 void	putsymb(LSym *s, char *name, int t, vlong v, vlong size, int ver, LSym *typ);

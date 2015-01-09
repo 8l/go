@@ -48,6 +48,7 @@ enum
 	REGRT2		= 4,	/* reserved for runtime, duffcopy */
 	REGMIN		= 7,	/* register variables allocated from here to REGMAX */
 	REGENV		= 11,	/* environment for closures */
+	REGTLS		= 13,	/* C ABI TLS base pointer */
 	REGMAX		= 27,
 	REGEXT		= 30,	/* external registers allocated from here down */
 	REGG		= 30,	/* G */
@@ -101,15 +102,16 @@ enum
 	C_SPR,		/* special processor register */
 	C_ZCON,
 	C_SCON,		/* 16 bit signed */
-	C_UCON,		/* low 16 bits 0 */
+	C_UCON,		/* 32 bit signed, low 16 bits 0 */
 	C_ADDCON,	/* -0x8000 <= v < 0 */
 	C_ANDCON,	/* 0 < v <= 0xFFFF */
 	C_LCON,		/* other 32 */
 	C_DCON,		/* other 64 (could subdivide further) */
-	C_SACON,
+	C_SACON,	/* $n(REG) where n <= int16 */
 	C_SECON,
-	C_LACON,
+	C_LACON,	/* $n(REG) where int16 < n <= int32 */
 	C_LECON,
+	C_DACON,	/* $n(REG) where int32 < n */
 	C_SBRA,
 	C_LBRA,
 	C_SAUTO,

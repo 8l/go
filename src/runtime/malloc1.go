@@ -89,10 +89,10 @@ func mallocinit() {
 	initSizes()
 
 	if class_to_size[_TinySizeClass] != _TinySize {
-		gothrow("bad TinySizeClass")
+		throw("bad TinySizeClass")
 	}
 
-	var p, arena_size, bitmap_size, spans_size, p_size, limit uintptr
+	var p, bitmapSize, spansSize, pSize, limit uintptr
 	var reserved bool
 
 	// limit = runtime.memlimit();
@@ -128,14 +128,14 @@ func mallocinit() {
 		// but it hardly matters: e0 00 is not valid UTF-8 either.
 		//
 		// If this fails we fall back to the 32 bit memory mechanism
-		arena_size = round(_MaxMem, _PageSize)
-		bitmap_size = arena_size / (ptrSize * 8 / 4)
-		spans_size = arena_size / _PageSize * ptrSize
-		spans_size = round(spans_size, _PageSize)
+		arenaSize := round(_MaxMem, _PageSize)
+		bitmapSize = arenaSize / (ptrSize * 8 / 4)
+		spansSize = arenaSize / _PageSize * ptrSize
+		spansSize = round(spansSize, _PageSize)
 		for i := 0; i <= 0x7f; i++ {
 			p = uintptr(i)<<40 | uintptrMask&(0x00c0<<32)
-			p_size = bitmap_size + spans_size + arena_size + _PageSize
-			p = uintptr(sysReserve(unsafe.Pointer(p), p_size, &reserved))
+			pSize = bitmapSize + spansSize + arenaSize + _PageSize
+			p = uintptr(sysReserve(unsafe.Pointer(p), pSize, &reserved))
 			if p != 0 {
 				break
 			}
@@ -148,7 +148,7 @@ func mallocinit() {
 		// Instead we map the memory information bitmap
 		// immediately after the data segment, large enough
 		// to handle another 2GB of mappings (256 MB),
-		// along with a reservation for another 512 MB of memory.
+		// along with a reservation for an initial arena.
 		// When that gets used up, we'll start asking the kernel
 		// for any memory anywhere and hope it's in the 2GB
 		// following the bitmap (presumably the executable begins
@@ -160,30 +160,43 @@ func mallocinit() {
 		// for 4GB of mappings, and then accept any memory the
 		// kernel threw at us, but normally that's a waste of 512 MB
 		// of address space, which is probably too much in a 32-bit world.
-		bitmap_size = _MaxArena32 / (ptrSize * 8 / 4)
-		arena_size = 512 << 20
-		spans_size = _MaxArena32 / _PageSize * ptrSize
-		if limit > 0 && arena_size+bitmap_size+spans_size > limit {
-			bitmap_size = (limit / 9) &^ ((1 << _PageShift) - 1)
-			arena_size = bitmap_size * 8
-			spans_size = arena_size / _PageSize * ptrSize
-		}
-		spans_size = round(spans_size, _PageSize)
 
-		// SysReserve treats the address we ask for, end, as a hint,
-		// not as an absolute requirement.  If we ask for the end
-		// of the data segment but the operating system requires
-		// a little more space before we can start allocating, it will
-		// give out a slightly higher pointer.  Except QEMU, which
-		// is buggy, as usual: it won't adjust the pointer upward.
-		// So adjust it upward a little bit ourselves: 1/4 MB to get
-		// away from the running binary image and then round up
-		// to a MB boundary.
-		p = round(uintptr(unsafe.Pointer(&end))+(1<<18), 1<<20)
-		p_size = bitmap_size + spans_size + arena_size + _PageSize
-		p = uintptr(sysReserve(unsafe.Pointer(p), p_size, &reserved))
+		// If we fail to allocate, try again with a smaller arena.
+		// This is necessary on Android L where we share a process
+		// with ART, which reserves virtual memory aggressively.
+		arenaSizes := []uintptr{
+			512 << 20,
+			256 << 20,
+		}
+
+		for _, arenaSize := range arenaSizes {
+			bitmapSize = _MaxArena32 / (ptrSize * 8 / 4)
+			spansSize = _MaxArena32 / _PageSize * ptrSize
+			if limit > 0 && arenaSize+bitmapSize+spansSize > limit {
+				bitmapSize = (limit / 9) &^ ((1 << _PageShift) - 1)
+				arenaSize = bitmapSize * 8
+				spansSize = arenaSize / _PageSize * ptrSize
+			}
+			spansSize = round(spansSize, _PageSize)
+
+			// SysReserve treats the address we ask for, end, as a hint,
+			// not as an absolute requirement.  If we ask for the end
+			// of the data segment but the operating system requires
+			// a little more space before we can start allocating, it will
+			// give out a slightly higher pointer.  Except QEMU, which
+			// is buggy, as usual: it won't adjust the pointer upward.
+			// So adjust it upward a little bit ourselves: 1/4 MB to get
+			// away from the running binary image and then round up
+			// to a MB boundary.
+			p = round(uintptr(unsafe.Pointer(&end))+(1<<18), 1<<20)
+			pSize = bitmapSize + spansSize + arenaSize + _PageSize
+			p = uintptr(sysReserve(unsafe.Pointer(p), pSize, &reserved))
+			if p != 0 {
+				break
+			}
+		}
 		if p == 0 {
-			gothrow("runtime: cannot reserve arena virtual address space")
+			throw("runtime: cannot reserve arena virtual address space")
 		}
 	}
 
@@ -193,21 +206,107 @@ func mallocinit() {
 	p1 := round(p, _PageSize)
 
 	mheap_.spans = (**mspan)(unsafe.Pointer(p1))
-	mheap_.bitmap = p1 + spans_size
-	mheap_.arena_start = p1 + (spans_size + bitmap_size)
+	mheap_.bitmap = p1 + spansSize
+	mheap_.arena_start = p1 + (spansSize + bitmapSize)
 	mheap_.arena_used = mheap_.arena_start
-	mheap_.arena_end = p + p_size
+	mheap_.arena_end = p + pSize
 	mheap_.arena_reserved = reserved
 
 	if mheap_.arena_start&(_PageSize-1) != 0 {
-		println("bad pagesize", hex(p), hex(p1), hex(spans_size), hex(bitmap_size), hex(_PageSize), "start", hex(mheap_.arena_start))
-		gothrow("misrounded allocation in mallocinit")
+		println("bad pagesize", hex(p), hex(p1), hex(spansSize), hex(bitmapSize), hex(_PageSize), "start", hex(mheap_.arena_start))
+		throw("misrounded allocation in mallocinit")
 	}
 
 	// Initialize the rest of the allocator.
-	mHeap_Init(&mheap_, spans_size)
+	mHeap_Init(&mheap_, spansSize)
 	_g_ := getg()
 	_g_.m.mcache = allocmcache()
+}
+
+func wbshadowinit() {
+	// Initialize write barrier shadow heap if we were asked for it
+	// and we have enough address space (not on 32-bit).
+	if debug.wbshadow == 0 {
+		return
+	}
+	if ptrSize != 8 {
+		print("runtime: GODEBUG=wbshadow=1 disabled on 32-bit system\n")
+		return
+	}
+
+	var reserved bool
+	p1 := sysReserveHigh(mheap_.arena_end-mheap_.arena_start, &reserved)
+	if p1 == nil {
+		throw("cannot map shadow heap")
+	}
+	mheap_.shadow_heap = uintptr(p1) - mheap_.arena_start
+	sysMap(p1, mheap_.arena_used-mheap_.arena_start, reserved, &memstats.other_sys)
+	memmove(p1, unsafe.Pointer(mheap_.arena_start), mheap_.arena_used-mheap_.arena_start)
+
+	mheap_.shadow_reserved = reserved
+	start := ^uintptr(0)
+	end := uintptr(0)
+	if start > uintptr(unsafe.Pointer(&noptrdata)) {
+		start = uintptr(unsafe.Pointer(&noptrdata))
+	}
+	if start > uintptr(unsafe.Pointer(&data)) {
+		start = uintptr(unsafe.Pointer(&data))
+	}
+	if start > uintptr(unsafe.Pointer(&noptrbss)) {
+		start = uintptr(unsafe.Pointer(&noptrbss))
+	}
+	if start > uintptr(unsafe.Pointer(&bss)) {
+		start = uintptr(unsafe.Pointer(&bss))
+	}
+	if end < uintptr(unsafe.Pointer(&enoptrdata)) {
+		end = uintptr(unsafe.Pointer(&enoptrdata))
+	}
+	if end < uintptr(unsafe.Pointer(&edata)) {
+		end = uintptr(unsafe.Pointer(&edata))
+	}
+	if end < uintptr(unsafe.Pointer(&enoptrbss)) {
+		end = uintptr(unsafe.Pointer(&enoptrbss))
+	}
+	if end < uintptr(unsafe.Pointer(&ebss)) {
+		end = uintptr(unsafe.Pointer(&ebss))
+	}
+	start &^= _PageSize - 1
+	end = round(end, _PageSize)
+	mheap_.data_start = start
+	mheap_.data_end = end
+	reserved = false
+	p1 = sysReserveHigh(end-start, &reserved)
+	if p1 == nil {
+		throw("cannot map shadow data")
+	}
+	mheap_.shadow_data = uintptr(p1) - start
+	sysMap(p1, end-start, reserved, &memstats.other_sys)
+	memmove(p1, unsafe.Pointer(start), end-start)
+
+	mheap_.shadow_enabled = true
+}
+
+// sysReserveHigh reserves space somewhere high in the address space.
+// sysReserve doesn't actually reserve the full amount requested on
+// 64-bit systems, because of problems with ulimit. Instead it checks
+// that it can get the first 64 kB and assumes it can grab the rest as
+// needed. This doesn't work well with the "let the kernel pick an address"
+// mode, so don't do that. Pick a high address instead.
+func sysReserveHigh(n uintptr, reserved *bool) unsafe.Pointer {
+	if ptrSize == 4 {
+		return sysReserve(nil, n, reserved)
+	}
+
+	for i := 0; i <= 0x7f; i++ {
+		p := uintptr(i)<<40 | uintptrMask&(0x00c0<<32)
+		*reserved = false
+		p = uintptr(sysReserve(unsafe.Pointer(p), n, reserved))
+		if p != 0 {
+			return unsafe.Pointer(p)
+		}
+	}
+
+	return sysReserve(nil, n, reserved)
 }
 
 func mHeap_SysAlloc(h *mheap, n uintptr) unsafe.Pointer {
@@ -247,9 +346,12 @@ func mHeap_SysAlloc(h *mheap, n uintptr) unsafe.Pointer {
 		if raceenabled {
 			racemapshadow((unsafe.Pointer)(p), n)
 		}
+		if mheap_.shadow_enabled {
+			sysMap(unsafe.Pointer(p+mheap_.shadow_heap), n, h.shadow_reserved, &memstats.other_sys)
+		}
 
 		if uintptr(p)&(_PageSize-1) != 0 {
-			gothrow("misrounded allocation in MHeap_SysAlloc")
+			throw("misrounded allocation in MHeap_SysAlloc")
 		}
 		return (unsafe.Pointer)(p)
 	}
@@ -289,7 +391,7 @@ func mHeap_SysAlloc(h *mheap, n uintptr) unsafe.Pointer {
 	}
 
 	if uintptr(p)&(_PageSize-1) != 0 {
-		gothrow("misrounded allocation in MHeap_SysAlloc")
+		throw("misrounded allocation in MHeap_SysAlloc")
 	}
 	return (unsafe.Pointer)(p)
 }
@@ -300,7 +402,7 @@ func largeAlloc(size uintptr, flag uint32) *mspan {
 	// print("largeAlloc size=", size, "\n")
 
 	if size+_PageSize < size {
-		gothrow("out of memory")
+		throw("out of memory")
 	}
 	npages := size >> _PageShift
 	if size&_PageMask != 0 {
@@ -308,7 +410,7 @@ func largeAlloc(size uintptr, flag uint32) *mspan {
 	}
 	s := mHeap_Alloc(&mheap_, npages, 0, true, flag&_FlagNoZero == 0)
 	if s == nil {
-		gothrow("out of memory")
+		throw("out of memory")
 	}
 	s.limit = uintptr(s.start)<<_PageShift + size
 	v := unsafe.Pointer(uintptr(s.start) << _PageShift)

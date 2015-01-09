@@ -39,17 +39,34 @@ type pageID uintptr
 // base address for all 0-byte allocations
 var zerobase uintptr
 
+// Determine whether to initiate a GC.
+// Currently the primitive heuristic we use will start a new
+// concurrent GC when approximately half the available space
+// made available by the last GC cycle has been used.
+// If the GC is already working no need to trigger another one.
+// This should establish a feedback loop where if the GC does not
+// have sufficient time to complete then more memory will be
+// requested from the OS increasing heap size thus allow future
+// GCs more time to complete.
+// memstat.heap_alloc and memstat.next_gc reads have benign races
+// A false negative simple does not start a GC, a false positive
+// will start a GC needlessly. Neither have correctness issues.
+func shouldtriggergc() bool {
+	return memstats.heap_alloc+memstats.heap_alloc*3/4 >= memstats.next_gc && atomicloaduint(&bggc.working) == 0
+}
+
 // Allocate an object of size bytes.
 // Small objects are allocated from the per-P cache's free lists.
 // Large objects (> 32 kB) are allocated straight from the heap.
 func mallocgc(size uintptr, typ *_type, flags uint32) unsafe.Pointer {
+	shouldhelpgc := false
 	if size == 0 {
 		return unsafe.Pointer(&zerobase)
 	}
 	size0 := size
 
 	if flags&flagNoScan == 0 && typ == nil {
-		gothrow("malloc missing type")
+		throw("malloc missing type")
 	}
 
 	// This function must be atomic wrt GC, but for performance reasons
@@ -60,7 +77,7 @@ func mallocgc(size uintptr, typ *_type, flags uint32) unsafe.Pointer {
 	if debugMalloc {
 		mp := acquirem()
 		if mp.mallocing != 0 {
-			gothrow("malloc deadlock")
+			throw("malloc deadlock")
 		}
 		mp.mallocing = 1
 		if mp.curg != nil {
@@ -123,7 +140,7 @@ func mallocgc(size uintptr, typ *_type, flags uint32) unsafe.Pointer {
 					if debugMalloc {
 						mp := acquirem()
 						if mp.mallocing == 0 {
-							gothrow("bad malloc")
+							throw("bad malloc")
 						}
 						mp.mallocing = 0
 						if mp.curg != nil {
@@ -144,6 +161,7 @@ func mallocgc(size uintptr, typ *_type, flags uint32) unsafe.Pointer {
 				systemstack(func() {
 					mCache_Refill(c, tinySizeClass)
 				})
+				shouldhelpgc = true
 				s = c.alloc[tinySizeClass]
 				v = s.freelist
 			}
@@ -174,6 +192,7 @@ func mallocgc(size uintptr, typ *_type, flags uint32) unsafe.Pointer {
 				systemstack(func() {
 					mCache_Refill(c, int32(sizeclass))
 				})
+				shouldhelpgc = true
 				s = c.alloc[sizeclass]
 				v = s.freelist
 			}
@@ -191,6 +210,7 @@ func mallocgc(size uintptr, typ *_type, flags uint32) unsafe.Pointer {
 		c.local_cachealloc += intptr(size)
 	} else {
 		var s *mspan
+		shouldhelpgc = true
 		systemstack(func() {
 			s = largeAlloc(size, uint32(flags))
 		})
@@ -222,7 +242,7 @@ func mallocgc(size uintptr, typ *_type, flags uint32) unsafe.Pointer {
 		shift := (off % wordsPerBitmapByte) * gcBits
 		if debugMalloc && ((*xbits>>shift)&(bitMask|bitPtrMask)) != bitBoundary {
 			println("runtime: bits =", (*xbits>>shift)&(bitMask|bitPtrMask))
-			gothrow("bad bits in markallocated")
+			throw("bad bits in markallocated")
 		}
 
 		var ti, te uintptr
@@ -242,7 +262,7 @@ func mallocgc(size uintptr, typ *_type, flags uint32) unsafe.Pointer {
 			masksize++                                // unroll flag in the beginning
 			if masksize > maxGCMask && typ.gc[1] != 0 {
 				// write barriers have not been updated to deal with this case yet.
-				gothrow("maxGCMask too small for now")
+				throw("maxGCMask too small for now")
 				// If the mask is too large, unroll the program directly
 				// into the GC bitmap. It's 7 times slower than copying
 				// from the pre-unrolled mask, but saves 1/16 of type size
@@ -308,6 +328,10 @@ marked:
 		})
 	}
 
+	if mheap_.shadow_enabled {
+		clearshadow(uintptr(x), size)
+	}
+
 	if raceenabled {
 		racemalloc(x, size)
 	}
@@ -315,7 +339,7 @@ marked:
 	if debugMalloc {
 		mp := acquirem()
 		if mp.mallocing == 0 {
-			gothrow("bad malloc")
+			throw("bad malloc")
 		}
 		mp.mallocing = 0
 		if mp.curg != nil {
@@ -341,8 +365,15 @@ marked:
 		}
 	}
 
-	if memstats.heap_alloc >= memstats.next_gc/2 {
+	if shouldtriggergc() {
 		gogc(0)
+	} else if shouldhelpgc && atomicloaduint(&bggc.working) == 1 {
+		// bggc.lock not taken since race on bggc.working is benign.
+		// At worse we don't call gchelpwork.
+		// Delay the gchelpwork until the epilogue so that it doesn't
+		// interfere with the inner working of malloc such as
+		// mcache refills that might happen while doing the gchelpwork
+		systemstack(gchelpwork)
 	}
 
 	return x
@@ -360,7 +391,7 @@ func loadPtrMask(typ *_type) []uint8 {
 		masksize++                                // unroll flag in the beginning
 		if masksize > maxGCMask && typ.gc[1] != 0 {
 			// write barriers have not been updated to deal with this case yet.
-			gothrow("maxGCMask too small for now")
+			throw("maxGCMask too small for now")
 		}
 		ptrmask = (*uint8)(unsafe.Pointer(uintptr(typ.gc[0])))
 		// Check whether the program is already unrolled
@@ -387,6 +418,11 @@ func newobject(typ *_type) unsafe.Pointer {
 	return mallocgc(uintptr(typ.size), typ, flags)
 }
 
+//go:linkname reflect_unsafe_New reflect.unsafe_New
+func reflect_unsafe_New(typ *_type) unsafe.Pointer {
+	return newobject(typ)
+}
+
 // implementation of make builtin for slices
 func newarray(typ *_type, n uintptr) unsafe.Pointer {
 	flags := uint32(0)
@@ -399,24 +435,15 @@ func newarray(typ *_type, n uintptr) unsafe.Pointer {
 	return mallocgc(uintptr(typ.size)*n, typ, flags)
 }
 
+//go:linkname reflect_unsafe_NewArray reflect.unsafe_NewArray
+func reflect_unsafe_NewArray(typ *_type, n uintptr) unsafe.Pointer {
+	return newarray(typ, n)
+}
+
 // rawmem returns a chunk of pointerless memory.  It is
 // not zeroed.
 func rawmem(size uintptr) unsafe.Pointer {
 	return mallocgc(size, nil, flagNoScan|flagNoZero)
-}
-
-// round size up to next size class
-func goroundupsize(size uintptr) uintptr {
-	if size < maxSmallSize {
-		if size <= 1024-8 {
-			return uintptr(class_to_size[size_to_class8[(size+7)>>3]])
-		}
-		return uintptr(class_to_size[size_to_class128[(size-1024+127)>>7]])
-	}
-	if size+pageSize < size {
-		return size
-	}
-	return (size + pageSize - 1) &^ pageMask
 }
 
 func profilealloc(mp *m, x unsafe.Pointer, size uintptr) {
@@ -442,14 +469,22 @@ func profilealloc(mp *m, x unsafe.Pointer, size uintptr) {
 	mProf_Malloc(x, size)
 }
 
-// force = 1 - do GC regardless of current heap usage
-// force = 2 - go GC and eager sweep
+// For now this must be bracketed with a stoptheworld and a starttheworld to ensure
+// all go routines see the new barrier.
+func gcinstallmarkwb() {
+	gcphase = _GCmark
+}
+
+// force = 0 - start concurrent GC
+// force = 1 - do STW GC regardless of current heap usage
+// force = 2 - go STW GC and eager sweep
 func gogc(force int32) {
 	// The gc is turned off (via enablegc) until the bootstrap has completed.
 	// Also, malloc gets called in the guts of a number of libraries that might be
 	// holding locks. To avoid deadlocks during stoptheworld, don't bother
 	// trying to run gc while holding a lock. The next mallocgc without a lock
 	// will do the gc instead.
+
 	mp := acquirem()
 	if gp := getg(); gp == mp.g0 || mp.locks > 1 || !memstats.enablegc || panicking != 0 || gcpercent < 0 {
 		releasem(mp)
@@ -458,37 +493,66 @@ func gogc(force int32) {
 	releasem(mp)
 	mp = nil
 
+	if force == 0 {
+		lock(&bggc.lock)
+		if !bggc.started {
+			bggc.working = 1
+			bggc.started = true
+			go backgroundgc()
+		} else if bggc.working == 0 {
+			bggc.working = 1
+			ready(bggc.g)
+		}
+		unlock(&bggc.lock)
+	} else {
+		gcwork(force)
+	}
+}
+
+func gcwork(force int32) {
+
 	semacquire(&worldsema, false)
 
-	if force == 0 && memstats.heap_alloc < memstats.next_gc {
-		// typically threads which lost the race to grab
-		// worldsema exit here when gc is done.
-		semrelease(&worldsema)
-		return
+	// Pick up the remaining unswept/not being swept spans concurrently
+	for gosweepone() != ^uintptr(0) {
+		sweep.nbgsweep++
 	}
 
 	// Ok, we're doing it!  Stop everybody else
-	startTime := nanotime()
-	mp = acquirem()
+
+	mp := acquirem()
 	mp.gcing = 1
 	releasem(mp)
-
+	gctimer.count++
+	if force == 0 {
+		gctimer.cycle.sweepterm = nanotime()
+	}
+	// Pick up the remaining unswept/not being swept spans before we STW
+	for gosweepone() != ^uintptr(0) {
+		sweep.nbgsweep++
+	}
 	systemstack(stoptheworld)
 	systemstack(finishsweep_m) // finish sweep before we start concurrent scan.
-	if true {                  // To turn on concurrent scan and mark set to true...
+	if force == 0 {            // Do as much work concurrently as possible
+		gcphase = _GCscan
 		systemstack(starttheworld)
+		gctimer.cycle.scan = nanotime()
 		// Do a concurrent heap scan before we stop the world.
 		systemstack(gcscan_m)
+		gctimer.cycle.installmarkwb = nanotime()
 		systemstack(stoptheworld)
-		systemstack(gcinstallmarkwb_m)
+		systemstack(gcinstallmarkwb)
 		systemstack(starttheworld)
+		gctimer.cycle.mark = nanotime()
 		systemstack(gcmark_m)
+		gctimer.cycle.markterm = nanotime()
 		systemstack(stoptheworld)
 		systemstack(gcinstalloffwb_m)
 	}
 
+	startTime := nanotime()
 	if mp != acquirem() {
-		gothrow("gogc: rescheduled")
+		throw("gogc: rescheduled")
 	}
 
 	clearpools()
@@ -505,6 +569,7 @@ func gogc(force int32) {
 	eagersweep := force >= 2
 	for i := 0; i < n; i++ {
 		if i > 0 {
+			// refresh start time if doing a second GC
 			startTime = nanotime()
 		}
 		// switch to g0, call gc, then switch back
@@ -519,8 +584,23 @@ func gogc(force int32) {
 
 	// all done
 	mp.gcing = 0
+
+	if force == 0 {
+		gctimer.cycle.sweep = nanotime()
+	}
+
 	semrelease(&worldsema)
+
+	if force == 0 {
+		if gctimer.verbose > 1 {
+			GCprinttimes()
+		} else if gctimer.verbose > 0 {
+			calctimes() // ignore result
+		}
+	}
+
 	systemstack(starttheworld)
+
 	releasem(mp)
 	mp = nil
 
@@ -537,6 +617,110 @@ func GCcheckmarkenable() {
 
 func GCcheckmarkdisable() {
 	systemstack(gccheckmarkdisable_m)
+}
+
+// gctimes records the time in nanoseconds of each phase of the concurrent GC.
+type gctimes struct {
+	sweepterm     int64 // stw
+	scan          int64
+	installmarkwb int64 // stw
+	mark          int64
+	markterm      int64 // stw
+	sweep         int64
+}
+
+// gcchronograph holds timer information related to GC phases
+// max records the maximum time spent in each GC phase since GCstarttimes.
+// total records the total time spent in each GC phase since GCstarttimes.
+// cycle records the absolute time (as returned by nanoseconds()) that each GC phase last started at.
+type gcchronograph struct {
+	count    int64
+	verbose  int64
+	maxpause int64
+	max      gctimes
+	total    gctimes
+	cycle    gctimes
+}
+
+var gctimer gcchronograph
+
+// GCstarttimes initializes the gc times. All previous times are lost.
+func GCstarttimes(verbose int64) {
+	gctimer = gcchronograph{verbose: verbose}
+}
+
+// GCendtimes stops the gc timers.
+func GCendtimes() {
+	gctimer.verbose = 0
+}
+
+// calctimes converts gctimer.cycle into the elapsed times, updates gctimer.total
+// and updates gctimer.max with the max pause time.
+func calctimes() gctimes {
+	var times gctimes
+
+	var max = func(a, b int64) int64 {
+		if a > b {
+			return a
+		}
+		return b
+	}
+
+	times.sweepterm = gctimer.cycle.scan - gctimer.cycle.sweepterm
+	gctimer.total.sweepterm += times.sweepterm
+	gctimer.max.sweepterm = max(gctimer.max.sweepterm, times.sweepterm)
+	gctimer.maxpause = max(gctimer.maxpause, gctimer.max.sweepterm)
+
+	times.scan = gctimer.cycle.installmarkwb - gctimer.cycle.scan
+	gctimer.total.scan += times.scan
+	gctimer.max.scan = max(gctimer.max.scan, times.scan)
+
+	times.installmarkwb = gctimer.cycle.mark - gctimer.cycle.installmarkwb
+	gctimer.total.installmarkwb += times.installmarkwb
+	gctimer.max.installmarkwb = max(gctimer.max.installmarkwb, times.installmarkwb)
+	gctimer.maxpause = max(gctimer.maxpause, gctimer.max.installmarkwb)
+
+	times.mark = gctimer.cycle.markterm - gctimer.cycle.mark
+	gctimer.total.mark += times.mark
+	gctimer.max.mark = max(gctimer.max.mark, times.mark)
+
+	times.markterm = gctimer.cycle.sweep - gctimer.cycle.markterm
+	gctimer.total.markterm += times.markterm
+	gctimer.max.markterm = max(gctimer.max.markterm, times.markterm)
+	gctimer.maxpause = max(gctimer.maxpause, gctimer.max.markterm)
+
+	return times
+}
+
+// GCprinttimes prints latency information in nanoseconds about various
+// phases in the GC. The information for each phase includes the maximum pause
+// and total time since the most recent call to GCstarttimes as well as
+// the information from the most recent Concurent GC cycle. Calls from the
+// application to runtime.GC() are ignored.
+func GCprinttimes() {
+	if gctimer.verbose == 0 {
+		println("GC timers not enabled")
+		return
+	}
+
+	// Explicitly put times on the heap so printPhase can use it.
+	times := new(gctimes)
+	*times = calctimes()
+	cycletime := gctimer.cycle.sweep - gctimer.cycle.sweepterm
+	pause := times.sweepterm + times.installmarkwb + times.markterm
+	gomaxprocs := GOMAXPROCS(-1)
+
+	printlock()
+	print("GC: #", gctimer.count, " ", cycletime, "ns @", gctimer.cycle.sweepterm, " pause=", pause, " maxpause=", gctimer.maxpause, " goroutines=", allglen, " gomaxprocs=", gomaxprocs, "\n")
+	printPhase := func(label string, get func(*gctimes) int64, procs int) {
+		print("GC:     ", label, " ", get(times), "ns\tmax=", get(&gctimer.max), "\ttotal=", get(&gctimer.total), "\tprocs=", procs, "\n")
+	}
+	printPhase("sweep term:", func(t *gctimes) int64 { return t.sweepterm }, gomaxprocs)
+	printPhase("scan:      ", func(t *gctimes) int64 { return t.scan }, 1)
+	printPhase("install wb:", func(t *gctimes) int64 { return t.installmarkwb }, gomaxprocs)
+	printPhase("mark:      ", func(t *gctimes) int64 { return t.mark }, 1)
+	printPhase("mark term: ", func(t *gctimes) int64 { return t.markterm }, gomaxprocs)
+	printunlock()
 }
 
 // GC runs a garbage collection.
@@ -600,14 +784,14 @@ func SetFinalizer(obj interface{}, finalizer interface{}) {
 	e := (*eface)(unsafe.Pointer(&obj))
 	etyp := e._type
 	if etyp == nil {
-		gothrow("runtime.SetFinalizer: first argument is nil")
+		throw("runtime.SetFinalizer: first argument is nil")
 	}
 	if etyp.kind&kindMask != kindPtr {
-		gothrow("runtime.SetFinalizer: first argument is " + *etyp._string + ", not pointer")
+		throw("runtime.SetFinalizer: first argument is " + *etyp._string + ", not pointer")
 	}
 	ot := (*ptrtype)(unsafe.Pointer(etyp))
 	if ot.elem == nil {
-		gothrow("nil elem type!")
+		throw("nil elem type!")
 	}
 
 	// find the containing object
@@ -633,14 +817,14 @@ func SetFinalizer(obj interface{}, finalizer interface{}) {
 			uintptr(unsafe.Pointer(&noptrbss)) <= uintptr(e.data) && uintptr(e.data) < uintptr(unsafe.Pointer(&enoptrbss)) {
 			return
 		}
-		gothrow("runtime.SetFinalizer: pointer not in allocated block")
+		throw("runtime.SetFinalizer: pointer not in allocated block")
 	}
 
 	if e.data != base {
 		// As an implementation detail we allow to set finalizers for an inner byte
 		// of an object if it could come from tiny alloc (see mallocgc for details).
 		if ot.elem == nil || ot.elem.kind&kindNoPointers == 0 || ot.elem.size >= maxTinySize {
-			gothrow("runtime.SetFinalizer: pointer not at beginning of allocated block")
+			throw("runtime.SetFinalizer: pointer not at beginning of allocated block")
 		}
 	}
 
@@ -655,12 +839,12 @@ func SetFinalizer(obj interface{}, finalizer interface{}) {
 	}
 
 	if ftyp.kind&kindMask != kindFunc {
-		gothrow("runtime.SetFinalizer: second argument is " + *ftyp._string + ", not a function")
+		throw("runtime.SetFinalizer: second argument is " + *ftyp._string + ", not a function")
 	}
 	ft := (*functype)(unsafe.Pointer(ftyp))
 	ins := *(*[]*_type)(unsafe.Pointer(&ft.in))
 	if ft.dotdotdot || len(ins) != 1 {
-		gothrow("runtime.SetFinalizer: cannot pass " + *etyp._string + " to finalizer " + *ftyp._string)
+		throw("runtime.SetFinalizer: cannot pass " + *etyp._string + " to finalizer " + *ftyp._string)
 	}
 	fint := ins[0]
 	switch {
@@ -679,11 +863,11 @@ func SetFinalizer(obj interface{}, finalizer interface{}) {
 			// ok - satisfies empty interface
 			goto okarg
 		}
-		if _, ok := assertE2I2(ityp, obj); ok {
+		if assertE2I2(ityp, obj, nil) {
 			goto okarg
 		}
 	}
-	gothrow("runtime.SetFinalizer: cannot pass " + *etyp._string + " to finalizer " + *ftyp._string)
+	throw("runtime.SetFinalizer: cannot pass " + *etyp._string + " to finalizer " + *ftyp._string)
 okarg:
 	// compute size needed for return parameters
 	nret := uintptr(0)
@@ -697,7 +881,7 @@ okarg:
 
 	systemstack(func() {
 		if !addfinalizer(e.data, (*funcval)(f.data), nret, fint, ot) {
-			gothrow("runtime.SetFinalizer: finalizer already set")
+			throw("runtime.SetFinalizer: finalizer already set")
 		}
 	})
 }
@@ -795,7 +979,7 @@ func runfinq() {
 				}
 
 				if f.fint == nil {
-					gothrow("missing type in runfinq")
+					throw("missing type in runfinq")
 				}
 				switch f.fint.kind & kindMask {
 				case kindPtr:
@@ -809,12 +993,12 @@ func runfinq() {
 					if len(ityp.mhdr) != 0 {
 						// convert to interface with methods
 						// this conversion is guaranteed to succeed - we checked in SetFinalizer
-						*(*fInterface)(frame) = assertE2I(ityp, *(*interface{})(frame))
+						assertE2I(ityp, *(*interface{})(frame), (*fInterface)(frame))
 					}
 				default:
-					gothrow("bad kind in runfinq")
+					throw("bad kind in runfinq")
 				}
-				reflectcall(unsafe.Pointer(f.fn), frame, uint32(framesz), uint32(framesz))
+				reflectcall(nil, unsafe.Pointer(f.fn), frame, uint32(framesz), uint32(framesz))
 
 				// drop finalizer queue references to finalized object
 				f.fn = nil
@@ -850,10 +1034,10 @@ func persistentalloc(size, align uintptr, stat *uint64) unsafe.Pointer {
 
 	if align != 0 {
 		if align&(align-1) != 0 {
-			gothrow("persistentalloc: align is not a power of 2")
+			throw("persistentalloc: align is not a power of 2")
 		}
 		if align > _PageSize {
-			gothrow("persistentalloc: align is too large")
+			throw("persistentalloc: align is too large")
 		}
 	} else {
 		align = 8
@@ -869,7 +1053,7 @@ func persistentalloc(size, align uintptr, stat *uint64) unsafe.Pointer {
 		persistent.pos = sysAlloc(chunk, &memstats.other_sys)
 		if persistent.pos == nil {
 			unlock(&persistent.lock)
-			gothrow("runtime: cannot allocate memory")
+			throw("runtime: cannot allocate memory")
 		}
 		persistent.end = add(persistent.pos, chunk)
 	}

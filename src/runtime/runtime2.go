@@ -93,11 +93,35 @@ type slice struct {
 	cap   uint  // allocated number of elements
 }
 
+// A guintptr holds a goroutine pointer, but typed as a uintptr
+// to bypass write barriers. It is used in the Gobuf goroutine state.
+//
+// The Gobuf.g goroutine pointer is almost always updated by assembly code.
+// In one of the few places it is updated by Go code - func save - it must be
+// treated as a uintptr to avoid a write barrier being emitted at a bad time.
+// Instead of figuring out how to emit the write barriers missing in the
+// assembly manipulation, we change the type of the field to uintptr,
+// so that it does not require write barriers at all.
+//
+// Goroutine structs are published in the allg list and never freed.
+// That will keep the goroutine structs from being collected.
+// There is never a time that Gobuf.g's contain the only references
+// to a goroutine: the publishing of the goroutine in allg comes first.
+// Goroutine pointers are also kept in non-GC-visible places like TLS,
+// so I can't see them ever moving. If we did want to start moving data
+// in the GC, we'd need to allocate the goroutine structs from an
+// alternate arena. Using guintptr doesn't make that problem any worse.
+type guintptr uintptr
+
+func (gp guintptr) ptr() *g {
+	return (*g)(unsafe.Pointer(gp))
+}
+
 type gobuf struct {
 	// The offsets of sp, pc, and g are known to (hard-coded in) libmach.
 	sp   uintptr
 	pc   uintptr
-	g    *g
+	g    guintptr
 	ctxt unsafe.Pointer // this has to be a pointer so that gc scans it
 	ret  uintreg
 	lr   uintptr
@@ -191,7 +215,6 @@ type g struct {
 	gopc         uintptr // pc of go statement that created this goroutine
 	racectx      uintptr
 	waiting      *sudog // sudog structures this g is waiting on (that have a valid elem ptr)
-	end          [0]byte
 }
 
 type mts struct {
@@ -274,7 +297,6 @@ type m struct {
 	notesig *int8
 	errstr  *byte
 	//#endif
-	end [0]byte
 }
 
 type p struct {
@@ -372,6 +394,7 @@ const (
 	_SigHandling = 1 << 5 // our signal handler is registered
 	_SigIgnored  = 1 << 6 // the signal was ignored before we registered for it
 	_SigGoExit   = 1 << 7 // cause all runtime procs to exit (only used on Plan 9).
+	_SigSetStack = 1 << 8 // add SA_ONSTACK to libc handler
 )
 
 // Layout of in-memory per-function information prepared by linker
@@ -400,7 +423,7 @@ type itab struct {
 	link   *itab
 	bad    int32
 	unused int32
-	fun    [0]uintptr
+	fun    [1]uintptr // variable sized
 }
 
 // Lock-free stack node.
@@ -438,17 +461,6 @@ type cgomal struct {
 	alloc unsafe.Pointer
 }
 
-// Holds variables parsed from GODEBUG env var.
-type debugvars struct {
-	allocfreetrace int32
-	efence         int32
-	gctrace        int32
-	gcdead         int32
-	scheddetail    int32
-	schedtrace     int32
-	scavenge       int32
-}
-
 // Indicates to write barrier and sychronization task to preform.
 const (
 	_GCoff             = iota // GC not running, write barrier disabled
@@ -475,15 +487,30 @@ const (
 	_Structrnd = regSize
 )
 
-var startup_random_data *byte
-var startup_random_data_len uint32
+// startup_random_data holds random bytes initialized at startup.  These come from
+// the ELF AT_RANDOM auxiliary vector (vdso_linux_amd64.go or os_linux_386.go).
+var startupRandomData []byte
 
-var invalidptr int32
-
-const (
-	// hashinit wants this many random bytes
-	_HashRandomBytes = 32
-)
+// extendRandom extends the random numbers in r[:n] to the whole slice r.
+// Treats n<0 as n==0.
+func extendRandom(r []byte, n int) {
+	if n < 0 {
+		n = 0
+	}
+	for n < len(r) {
+		// Extend random bits using hash function & time seed
+		w := n
+		if w > 16 {
+			w = 16
+		}
+		h := memhash(unsafe.Pointer(&r[n-w]), uintptr(nanotime()), uintptr(w))
+		for i := 0; i < ptrSize && n < len(r); i++ {
+			r[n] = byte(h)
+			n++
+			h >>= 8
+		}
+	}
+}
 
 /*
  * deferred subroutine calls
@@ -491,7 +518,7 @@ const (
 type _defer struct {
 	siz     int32
 	started bool
-	argp    uintptr // where args were copied from
+	sp      uintptr // sp at time of defer
 	pc      uintptr
 	fn      *funcval
 	_panic  *_panic // panic that is running defer
@@ -551,7 +578,6 @@ var (
 	iscgo       bool
 	cpuid_ecx   uint32
 	cpuid_edx   uint32
-	debug       debugvars
 	signote     note
 	forcegc     forcegcstate
 	sched       schedt

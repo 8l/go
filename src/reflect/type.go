@@ -251,7 +251,7 @@ type rtype struct {
 	align         uint8             // alignment of variable with this type
 	fieldAlign    uint8             // alignment of struct field with this type
 	kind          uint8             // enumeration for C
-	alg           *typeAlg          // algorithm table (../runtime/runtime.h:/Alg)
+	alg           *typeAlg          // algorithm table
 	gc            [2]unsafe.Pointer // garbage collection data
 	string        *string           // string form; unnecessary but undeniably useful
 	*uncommonType                   // (relatively) uncommon fields
@@ -259,6 +259,7 @@ type rtype struct {
 	zero          unsafe.Pointer    // pointer to zero value
 }
 
+// a copy of runtime.typeAlg
 type typeAlg struct {
 	// function for hashing objects of this type
 	// (ptr to object, size, seed) -> hash
@@ -345,6 +346,7 @@ type mapType struct {
 	valuesize     uint8  // size of value slot
 	indirectvalue uint8  // store ptr to value instead of value itself
 	bucketsize    uint16 // size of bucket
+	reflexivekey  bool   // true if k==k for all keys
 }
 
 // ptrType represents a pointer type.
@@ -1423,6 +1425,7 @@ func ChanOf(dir ChanDir, t Type) Type {
 	prototype := *(**chanType)(unsafe.Pointer(&ichan))
 	ch := new(chanType)
 	*ch = *prototype
+	ch.dir = uintptr(dir)
 	ch.string = &s
 	ch.hash = fnv1(typ.hash, 'c', byte(dir))
 	ch.elem = typ
@@ -1489,6 +1492,7 @@ func MapOf(key, elem Type) Type {
 		mt.indirectvalue = 0
 	}
 	mt.bucketsize = uint16(mt.bucket.size)
+	mt.reflexivekey = isReflexive(ktyp)
 	mt.uncommonType = nil
 	mt.ptrToThis = nil
 	mt.zero = unsafe.Pointer(&make([]byte, mt.size)[0])
@@ -1496,10 +1500,37 @@ func MapOf(key, elem Type) Type {
 	return cachePut(ckey, &mt.rtype)
 }
 
+// isReflexive reports whether the == operation on the type is reflexive.
+// That is, x == x for all values x of type t.
+func isReflexive(t *rtype) bool {
+	switch t.Kind() {
+	case Bool, Int, Int8, Int16, Int32, Int64, Uint, Uint8, Uint16, Uint32, Uint64, Uintptr, Chan, Ptr, String, UnsafePointer:
+		return true
+	case Float32, Float64, Complex64, Complex128, Interface:
+		return false
+	case Array:
+		tt := (*arrayType)(unsafe.Pointer(t))
+		return isReflexive(tt.elem)
+	case Struct:
+		tt := (*structType)(unsafe.Pointer(t))
+		for _, f := range tt.fields {
+			if !isReflexive(f.typ) {
+				return false
+			}
+		}
+		return true
+	default:
+		// Func, Map, Slice, Invalid
+		panic("isReflexive called on non-key type " + t.String())
+	}
+}
+
 // gcProg is a helper type for generatation of GC pointer info.
 type gcProg struct {
-	gc   []byte
-	size uintptr // size of type in bytes
+	gc       []byte
+	size     uintptr // size of type in bytes
+	hasPtr   bool
+	lastZero uintptr // largest offset of a zero-byte field
 }
 
 func (gc *gcProg) append(v byte) {
@@ -1512,6 +1543,9 @@ func (gc *gcProg) appendProg(t *rtype) {
 	gc.align(uintptr(t.align))
 	if !t.pointers() {
 		gc.size += t.size
+		if t.size == 0 {
+			gc.lastZero = gc.size
+		}
 		return
 	}
 	switch t.Kind() {
@@ -1536,11 +1570,15 @@ func (gc *gcProg) appendProg(t *rtype) {
 		gc.appendWord(bitsPointer)
 		gc.appendWord(bitsPointer)
 	case Struct:
+		oldsize := gc.size
 		c := t.NumField()
 		for i := 0; i < c; i++ {
 			gc.appendProg(t.Field(i).Type.common())
 		}
-		gc.align(uintptr(t.align))
+		if gc.size > oldsize + t.size {
+			panic("reflect: struct components are larger than the struct itself")
+		}
+		gc.size = oldsize + t.size
 	}
 }
 
@@ -1556,11 +1594,17 @@ func (gc *gcProg) appendWord(v byte) {
 	gc.gc[nptr/2] &= ^(3 << ((nptr%2)*4 + 2))
 	gc.gc[nptr/2] |= v << ((nptr%2)*4 + 2)
 	gc.size += ptrsize
+	if v == bitsPointer {
+		gc.hasPtr = true
+	}
 }
 
-func (gc *gcProg) finalize() unsafe.Pointer {
+func (gc *gcProg) finalize() (unsafe.Pointer, bool) {
 	if gc.size == 0 {
-		return nil
+		return nil, false
+	}
+	if gc.lastZero == gc.size {
+		gc.size++
 	}
 	ptrsize := unsafe.Sizeof(uintptr(0))
 	gc.align(ptrsize)
@@ -1575,7 +1619,7 @@ func (gc *gcProg) finalize() unsafe.Pointer {
 			gc.appendWord(extractGCWord(gc.gc, i))
 		}
 	}
-	return unsafe.Pointer(&gc.gc[0])
+	return unsafe.Pointer(&gc.gc[0]), gc.hasPtr
 }
 
 func extractGCWord(gc []byte, i uintptr) byte {
@@ -1619,10 +1663,6 @@ func bucketOf(ktyp, etyp *rtype) *rtype {
 	for i := 0; i < int(bucketSize*unsafe.Sizeof(uint8(0))/ptrsize); i++ {
 		gc.append(bitsScalar)
 	}
-	gc.append(bitsPointer) // overflow
-	if runtime.GOARCH == "amd64p32" {
-		gc.append(bitsScalar)
-	}
 	// keys
 	for i := 0; i < bucketSize; i++ {
 		gc.appendProg(ktyp)
@@ -1631,10 +1671,15 @@ func bucketOf(ktyp, etyp *rtype) *rtype {
 	for i := 0; i < bucketSize; i++ {
 		gc.appendProg(etyp)
 	}
+	// overflow
+	gc.append(bitsPointer)
+	if runtime.GOARCH == "amd64p32" {
+		gc.append(bitsScalar)
+	}
 
 	b := new(rtype)
 	b.size = gc.size
-	b.gc[0] = gc.finalize()
+	b.gc[0], _ = gc.finalize()
 	s := "bucket(" + *ktyp.string + "," + *etyp.string + ")"
 	b.string = &s
 	return b
@@ -1835,7 +1880,11 @@ func funcLayout(t *rtype, rcvr *rtype) (frametype *rtype, argSize, retOffset uin
 	// build dummy rtype holding gc program
 	x := new(rtype)
 	x.size = gc.size
-	x.gc[0] = gc.finalize()
+	var hasPtr bool
+	x.gc[0], hasPtr = gc.finalize()
+	if !hasPtr {
+		x.kind |= kindNoPointers
+	}
 	var s string
 	if rcvr != nil {
 		s = "methodargs(" + *rcvr.string + ")(" + *t.string + ")"
@@ -1881,7 +1930,7 @@ func (bv *bitVector) append2(bits uint8) {
 
 func addTypeBits(bv *bitVector, offset *uintptr, t *rtype) {
 	*offset = align(*offset, uintptr(t.align))
-	if t.kind&kindNoPointers != 0 {
+	if !t.pointers() {
 		*offset += t.size
 		return
 	}
